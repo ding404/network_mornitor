@@ -29,6 +29,11 @@ The default interface is detected from `/proc/net/route`: the program picks the
 interface that owns the default route. If no default route exists, it falls back
 to the first non-loopback interface listed in `/proc/net/dev`.
 
+The program also builds a list of every non-loopback interface in
+`/proc/net/dev`. Press `n` or `p` to move through that list while running. If you
+name an interface on the command line and it is not in the list, the program
+puts it at the front of the list.
+
 All samples are stored in two ring buffers of 300 entries, which covers 5 minutes
 at a 1-second tick. The sparklines draw the newest 120 points, so the waveform
 window is about 2 minutes.
@@ -75,14 +80,21 @@ You can also run the built binary directly:
 
 | Key | Action |
 | --- | --- |
+| `n` / `N` / `Tab` | Switch to the next interface (wraps around) |
+| `p` / `P` / `BackTab` | Switch to the previous interface (wraps around) |
 | `q` / `Q` / `Esc` | Quit |
 | `r` / `R` | Reset history buffers and session peak |
+
+Switching interfaces clears the history buffers, resets the session peak, and
+re-reads the counters of the new interface. This makes the first sample on the
+new interface a real measurement instead of a bogus delta between two different
+counters. The title bar shows the position in the list, for example `iface 2/4`.
 
 ## Display
 
 | Area | Meaning |
 | --- | --- |
-| Title bar | Program name and the interface in use |
+| Title bar | Program name, the interface in use, and its position in the list |
 | DOWNLOAD gauge | Current download speed in bytes/s (binary units) |
 | UPLOAD gauge | Current upload speed in bytes/s (binary units) |
 | Download History | Download speed sparkline, newest 120 samples |
@@ -104,7 +116,9 @@ Cargo.toml       package manifest (ratatui 0.29, crossterm 0.28)
 ## Limitations
 
 - Linux only (`/proc` filesystem required).
-- One interface at a time; it does not aggregate all interfaces.
+- One interface at a time; it does not aggregate all interfaces. The interface
+  list is read once at start, so a hot-plugged interface does not appear until
+  you restart the program.
 - Counters are read once per second, so short bursts inside a tick are averaged
   into that interval.
 - Sparkline scaling is per-window, so the vertical scale changes when traffic

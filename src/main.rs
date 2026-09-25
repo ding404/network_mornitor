@@ -31,6 +31,10 @@ const TICK_MS: u64 = 1000;
 struct App {
     /// Network interface name (e.g. "eth0", "wlp2s0").
     iface: String,
+    /// All switchable interfaces found in /proc/net/dev (excludes "lo").
+    ifaces: Vec<String>,
+    /// Index of the active interface inside `ifaces`.
+    iface_idx: usize,
     /// Download speed history (bytes/s), newest at the back.
     rx_history: VecDeque<u64>,
     /// Upload speed history (bytes/s), newest at the back.
@@ -50,9 +54,11 @@ struct App {
 }
 
 impl App {
-    fn new(iface: String) -> Self {
+    fn new(iface: String, ifaces: Vec<String>, iface_idx: usize) -> Self {
         Self {
             iface,
+            ifaces,
+            iface_idx,
             rx_history: VecDeque::with_capacity(MAX_HISTORY),
             tx_history: VecDeque::with_capacity(MAX_HISTORY),
             current_rx: 0,
@@ -126,6 +132,33 @@ impl App {
         Ok(())
     }
 
+    /// Switch to the interface at `idx` (wrapping). Resets history, peak and the
+    /// counter baseline so the first sample on the new interface is not a bogus delta.
+    fn switch_iface(&mut self, idx: usize) {
+        if self.ifaces.is_empty() {
+            return;
+        }
+        self.iface_idx = idx % self.ifaces.len();
+        self.iface = self.ifaces[self.iface_idx].clone();
+
+        // Drop history and peak from the previous interface.
+        self.rx_history.clear();
+        self.tx_history.clear();
+        self.current_rx = 0;
+        self.current_tx = 0;
+        self.peak_speed = 1;
+
+        // Re-baseline counters immediately; skip the delta on the next tick.
+        if let Ok((rx, tx)) = self.read_counters() {
+            self.prev_rx_bytes = rx;
+            self.prev_tx_bytes = tx;
+        } else {
+            self.prev_rx_bytes = 0;
+            self.prev_tx_bytes = 0;
+        }
+        self.last_sample = Instant::now();
+    }
+
     /// Return the displayed max for sparkline scaling (rolling window max + 10% headroom).
     fn sparkline_max(&self, history: &VecDeque<u64>) -> u64 {
         let window: Vec<&u64> = history
@@ -164,6 +197,28 @@ fn detect_interface() -> io::Result<String> {
         io::ErrorKind::NotFound,
         "no non-loopback network interface found",
     ))
+}
+
+/// List every non-loopback interface present in /proc/net/dev, in file order.
+fn list_interfaces() -> io::Result<Vec<String>> {
+    let content = fs::read_to_string("/proc/net/dev")?;
+    let mut names = Vec::new();
+    for line in content.lines().skip(2) {
+        let line = line.trim();
+        if let Some(idx) = line.find(':') {
+            let name = line[..idx].trim();
+            if !name.is_empty() && name != "lo" {
+                names.push(name.to_string());
+            }
+        }
+    }
+    if names.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no non-loopback network interface found",
+        ));
+    }
+    Ok(names)
 }
 
 /// Format bytes/s into a human-readable string.
@@ -234,6 +289,15 @@ fn ui(f: &mut Frame, app: &App) {
             format!("interface: {}", app.iface),
             Style::default().fg(Color::Yellow),
         ),
+        Span::raw("  │  "),
+        Span::styled(
+            format!("iface {}/{}", app.iface_idx + 1, app.ifaces.len()),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw("  │  "),
+        Span::styled("n/p: iface", Style::default().fg(Color::DarkGray)),
+        Span::raw("  │  "),
+        Span::styled("r: reset", Style::default().fg(Color::DarkGray)),
         Span::raw("  │  "),
         Span::styled("q: quit", Style::default().fg(Color::DarkGray)),
     ]))
@@ -335,7 +399,18 @@ fn main() -> io::Result<()> {
     // Allow CLI override: `netmon eth0`
     let iface = std::env::args().nth(1).unwrap_or(iface);
 
-    let mut app = App::new(iface);
+    // Build the switchable interface list. The requested interface stays first-class
+    // even if it is not in the list (e.g. an explicit "lo").
+    let mut ifaces = list_interfaces().unwrap_or_else(|_| vec![iface.clone()]);
+    let iface_idx = match ifaces.iter().position(|n| n == &iface) {
+        Some(i) => i,
+        None => {
+            ifaces.insert(0, iface.clone());
+            0
+        }
+    };
+
+    let mut app = App::new(iface, ifaces, iface_idx);
 
     // Initialise counters with the first read so tick() can compute a delta.
     match app.read_counters() {
@@ -395,6 +470,17 @@ fn run_app<B: Backend>(
                         app.rx_history.clear();
                         app.tx_history.clear();
                         app.peak_speed = 1;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Tab => {
+                        // Next interface (wrap around).
+                        app.switch_iface(app.iface_idx + 1);
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::BackTab => {
+                        // Previous interface (wrap around).
+                        let len = app.ifaces.len();
+                        if len > 0 {
+                            app.switch_iface(app.iface_idx + len - 1);
+                        }
                     }
                     _ => {}
                 }
