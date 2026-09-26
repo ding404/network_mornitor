@@ -118,6 +118,9 @@ You can also run the built binary directly:
 | `q` / `Q` / `Esc` | Quit |
 | `r` / `R` | Reset history buffers, session peak, connection monitor and filter |
 | `i` / `I` | Toggle automatic switching to the busiest interface |
+| **Click a column title** | Sort the list by that column. Clicking the active column again flips between ascending/descending; the active column is marked with `▲`/`▼` in the header |
+| `o` | Rotate the sort column to the next column available in the current view (keyboard alternative to clicking) |
+| `O` | Toggle the sort direction (ascending ↔ descending) on the current column |
 
 Switching interfaces clears the history buffers, resets the session peak, and
 re-reads the counters of the new interface. This makes the first sample on the

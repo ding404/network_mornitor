@@ -7,7 +7,10 @@ use std::io;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -104,6 +107,14 @@ struct App {
     filter_mode: bool,
     /// Active filter string (case-insensitive substring).
     filter: String,
+    /// Column the Top Connections list is sorted by.
+    sort_key: SortKey,
+    /// Sort direction: `true` = ascending, `false` = descending.
+    sort_asc: bool,
+    /// Terminal row of the connections-panel header, for click-to-sort hit testing.
+    header_y: u16,
+    /// Per-column header hitboxes `(x_start, x_end_exclusive, sort_key)` for mouse clicks.
+    col_hit: Vec<(u16, u16, SortKey)>,
 }
 
 impl App {
@@ -136,6 +147,10 @@ impl App {
             aggregate: false,
             filter_mode: false,
             filter: String::new(),
+            sort_key: SortKey::Throughput,
+            sort_asc: false,
+            header_y: 0,
+            col_hit: Vec::new(),
         }
     }
 
@@ -1039,6 +1054,134 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(footer, main_layout[2]);
 }
 
+/// Column that the Top Connections list can be sorted by. `Throughput` is the
+/// default ordering (total RX+TX, descending) that the list used before sorting
+/// was added; it has no dedicated header so it is never shown as the active column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortKey {
+    Throughput,
+    User,
+    Proc,
+    Proto,
+    Src,
+    Dst,
+    Host,
+    Svc,
+    Cpu,
+    Mem,
+    Time,
+    Conns,
+    Rx,
+    Tx,
+}
+
+/// Order in which `o` (rotate sort column) steps through columns, per view.
+const AGG_SORT_ORDER: [SortKey; 8] = [
+    SortKey::User,
+    SortKey::Proc,
+    SortKey::Cpu,
+    SortKey::Mem,
+    SortKey::Time,
+    SortKey::Conns,
+    SortKey::Rx,
+    SortKey::Tx,
+];
+const DETAIL_SORT_ORDER: [SortKey; 8] = [
+    SortKey::Proc,
+    SortKey::Proto,
+    SortKey::Src,
+    SortKey::Dst,
+    SortKey::Host,
+    SortKey::Svc,
+    SortKey::Rx,
+    SortKey::Tx,
+];
+
+/// A comparable value extracted for sorting. `None` sorts as empty so that a
+/// column which does not apply to the current view type keeps a stable order.
+#[derive(PartialEq)]
+enum SortVal {
+    None,
+    Text(String),
+    Num(f64),
+}
+
+impl Eq for SortVal {}
+
+impl Ord for SortVal {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (SortVal::None, SortVal::None) => std::cmp::Ordering::Equal,
+            (SortVal::None, _) => std::cmp::Ordering::Less,
+            (_, SortVal::None) => std::cmp::Ordering::Greater,
+            (SortVal::Text(a), SortVal::Text(b)) => a.cmp(b),
+            (SortVal::Num(a), SortVal::Num(b)) => {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            // Keep a deterministic order between the two present variants.
+            (SortVal::Text(_), SortVal::Num(_)) => std::cmp::Ordering::Less,
+            (SortVal::Num(_), SortVal::Text(_)) => std::cmp::Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for SortVal {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Label used for sorting by process (comm + pid), matching the displayed text.
+fn proc_sort_label(comm: &str, pid: Option<u32>) -> String {
+    match pid {
+        Some(p) => format!("{}({})", comm, p),
+        None => comm.to_string(),
+    }
+}
+
+/// Extract the sortable value for `row` under `key`.
+fn sort_val(row: &ConnRow, key: SortKey) -> SortVal {
+    match (row, key) {
+        (ConnRow::Agg(a), SortKey::User) => SortVal::Text(a.user.clone()),
+        (ConnRow::Agg(a), SortKey::Proc) => SortVal::Text(proc_sort_label(&a.comm, a.pid)),
+        (ConnRow::Agg(a), SortKey::Cpu) => SortVal::Num(a.cpu_pct),
+        (ConnRow::Agg(a), SortKey::Mem) => SortVal::Num(a.mem_pct),
+        (ConnRow::Agg(a), SortKey::Time) => SortVal::Num(a.time_secs),
+        (ConnRow::Agg(a), SortKey::Conns) => SortVal::Num(a.count as f64),
+        (ConnRow::Agg(a), SortKey::Rx) => SortVal::Num(a.rx_rate),
+        (ConnRow::Agg(a), SortKey::Tx) => SortVal::Num(a.tx_rate),
+        (ConnRow::Agg(a), SortKey::Throughput) => SortVal::Num(a.rx_rate + a.tx_rate),
+        (ConnRow::Detail(c), SortKey::Proc) => SortVal::Text(proc_sort_label(&c.comm, c.pid)),
+        (ConnRow::Detail(c), SortKey::Proto) => SortVal::Text(c.proto.clone()),
+        (ConnRow::Detail(c), SortKey::Src) => SortVal::Text(c.local.clone()),
+        (ConnRow::Detail(c), SortKey::Dst) => SortVal::Text(c.remote.clone()),
+        (ConnRow::Detail(c), SortKey::Host) => {
+            SortVal::Text(c.host.clone().unwrap_or_default())
+        }
+        (ConnRow::Detail(c), SortKey::Svc) => {
+            SortVal::Text(c.service.clone().unwrap_or_default())
+        }
+        (ConnRow::Detail(c), SortKey::Rx) => SortVal::Num(c.rx_rate.unwrap_or(0.0)),
+        (ConnRow::Detail(c), SortKey::Tx) => SortVal::Num(c.tx_rate.unwrap_or(0.0)),
+        (ConnRow::Detail(c), SortKey::Throughput) => {
+            SortVal::Num(c.rx_rate.unwrap_or(0.0) + c.tx_rate.unwrap_or(0.0))
+        }
+        _ => SortVal::None,
+    }
+}
+
+/// Sort `view` in place by `key`, in ascending order when `asc` is true.
+fn sort_rows(view: &mut [ConnRow], key: SortKey, asc: bool) {
+    view.sort_by(|a, b| {
+        let ord = sort_val(a, key).cmp(&sort_val(b, key));
+        if asc {
+            ord
+        } else {
+            ord.reverse()
+        }
+    });
+}
+
 /// One row in the connections table, in either detail (per-socket) or
 /// aggregated (per-process) form.
 enum ConnRow {
@@ -1048,7 +1191,7 @@ enum ConnRow {
 
 /// Render the Top Connections panel (detail or aggregated view) into `area`.
 fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
-    let view: Vec<ConnRow> = if app.aggregate {
+    let mut view: Vec<ConnRow> = if app.aggregate {
         app.conns
             .aggregate_view(&app.filter)
             .into_iter()
@@ -1061,6 +1204,11 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
             .map(ConnRow::Detail)
             .collect()
     };
+
+    // Sort the list according to the active column and direction. `Throughput`
+    // (the default) sorts by total RX+TX descending, matching the pre-sort order.
+    sort_rows(&mut view, app.sort_key, app.sort_asc);
+
     let view_len = view.len();
     let max_rows = (area.height.saturating_sub(3) as usize).max(1); // borders + header
     app.conns.clamp_scroll(view_len, max_rows);
@@ -1075,7 +1223,7 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
     if !app.filter.is_empty() || app.filter_mode {
         title.push_str(&format!("filter:\"{}\" ", app.filter));
     }
-    title.push_str("↑↓ pg:scroll c:focus a:agg /:filter");
+    title.push_str("↑↓ pg:scroll c:focus a:agg /:filter click hdr/o:sort O:dir");
 
     let block = Block::default().borders(Borders::ALL).title(title);
 
@@ -1095,15 +1243,90 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let header = if app.aggregate {
-        Row::new(vec![
-            "USER", "PROC(PID)", "CPU%", "MEM%", "TIME+", "CONNS", "RX", "TX",
-        ])
-        .style(Style::default().add_modifier(Modifier::BOLD))
+    let widths: Vec<Constraint> = if app.aggregate {
+        vec![
+            Constraint::Length(8),  // USER
+            Constraint::Min(16),    // PROC(PID)
+            Constraint::Length(16), // CPU%
+            Constraint::Length(16), // MEM%
+            Constraint::Length(10), // TIME+
+            Constraint::Length(6),  // CONNS
+            Constraint::Length(11), // RX
+            Constraint::Length(11), // TX
+        ]
     } else {
-        Row::new(vec!["PROC(PID)", "PRO", "SRC", "DST", "HOST", "SVC", "RX", "TX"])
-            .style(Style::default().add_modifier(Modifier::BOLD))
+        vec![
+            Constraint::Min(14),
+            Constraint::Length(4),
+            Constraint::Min(13),
+            Constraint::Min(13),
+            Constraint::Min(12),
+            Constraint::Length(7),
+            Constraint::Length(9),
+            Constraint::Length(9),
+        ]
     };
+
+    // Header labels + the SortKey each maps to (parallel arrays).
+    let (labels, keys): (&[&str], &[Option<SortKey>]) = if app.aggregate {
+        (
+            &["USER", "PROC(PID)", "CPU%", "MEM%", "TIME+", "CONNS", "RX", "TX"],
+            &[
+                Some(SortKey::User),
+                Some(SortKey::Proc),
+                Some(SortKey::Cpu),
+                Some(SortKey::Mem),
+                Some(SortKey::Time),
+                Some(SortKey::Conns),
+                Some(SortKey::Rx),
+                Some(SortKey::Tx),
+            ],
+        )
+    } else {
+        (
+            &["PROC(PID)", "PRO", "SRC", "DST", "HOST", "SVC", "RX", "TX"],
+            &[
+                Some(SortKey::Proc),
+                Some(SortKey::Proto),
+                Some(SortKey::Src),
+                Some(SortKey::Dst),
+                Some(SortKey::Host),
+                Some(SortKey::Svc),
+                Some(SortKey::Rx),
+                Some(SortKey::Tx),
+            ],
+        )
+    };
+    let marker = if app.sort_asc { " ▲" } else { " ▼" };
+    let header_cells: Vec<Cell> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, &lbl)| {
+            if keys.get(i).copied().flatten() == Some(app.sort_key) {
+                Cell::from(format!("{}{}", lbl, marker))
+            } else {
+                Cell::from(lbl)
+            }
+        })
+        .collect();
+    let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
+
+    // Record header hitboxes so a mouse click on a column title can re-sort.
+    // This mirrors how ratatui's Table lays the columns out inside the block
+    // (full inner width; we don't enable a scrollbar, so no column is reserved).
+    let inner = block.inner(area);
+    let col_rects = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(widths.clone())
+        .split(inner);
+    app.header_y = inner.y;
+    app.col_hit.clear();
+    for (i, k) in keys.iter().enumerate() {
+        if let Some(key) = k {
+            app.col_hit
+                .push((col_rects[i].x, col_rects[i].x + col_rects[i].width, *key));
+        }
+    }
 
     let rows = view
         .iter()
@@ -1165,30 +1388,6 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
             }
         });
 
-    let widths: Vec<Constraint> = if app.aggregate {
-        vec![
-            Constraint::Length(8),  // USER
-            Constraint::Min(16),    // PROC(PID)
-            Constraint::Length(16), // CPU% (sparkline + value)
-            Constraint::Length(16), // MEM% (sparkline + value)
-            Constraint::Length(10), // TIME+
-            Constraint::Length(6),  // CONNS
-            Constraint::Length(11), // RX
-            Constraint::Length(11), // TX
-        ]
-    } else {
-        vec![
-            Constraint::Min(14),
-            Constraint::Length(4),
-            Constraint::Min(13),
-            Constraint::Min(13),
-            Constraint::Min(12),
-            Constraint::Length(7),
-            Constraint::Length(9),
-            Constraint::Length(9),
-        ]
-    };
-
     let table = Table::default()
         .header(header)
         .block(block)
@@ -1239,7 +1438,7 @@ fn main() -> io::Result<()> {
     // Set up terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1249,7 +1448,11 @@ fn main() -> io::Result<()> {
 
     // Restore terminal.
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
 
     if let Err(err) = res {
         eprintln!("Error: {err:?}");
@@ -1271,20 +1474,21 @@ fn run_app<B: Backend>(
         // Wait for input or timeout.
         let timeout = tick_duration.saturating_sub(last_tick.elapsed());
         if crossterm::event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                // While typing a filter, route keys to the filter buffer.
-                if app.filter_mode {
-                    match key.code {
-                        KeyCode::Char(c) => app.filter.push(c),
-                        KeyCode::Backspace => {
-                            app.filter.pop();
+            match event::read()? {
+                Event::Key(key) => {
+                    // While typing a filter, route keys to the filter buffer.
+                    if app.filter_mode {
+                        match key.code {
+                            KeyCode::Char(c) => app.filter.push(c),
+                            KeyCode::Backspace => {
+                                app.filter.pop();
+                            }
+                            KeyCode::Enter | KeyCode::Esc => app.filter_mode = false,
+                            _ => {}
                         }
-                        KeyCode::Enter | KeyCode::Esc => app.filter_mode = false,
-                        _ => {}
+                        continue;
                     }
-                    continue;
-                }
-                match key.code {
+                    match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                         return Ok(());
                     }
@@ -1314,6 +1518,9 @@ fn run_app<B: Backend>(
                     KeyCode::Char('a') | KeyCode::Char('A') => {
                         // Toggle aggregate-by-process view.
                         app.aggregate = !app.aggregate;
+                        // Columns differ between views, so fall back to the default order.
+                        app.sort_key = SortKey::Throughput;
+                        app.sort_asc = false;
                         app.conns.scroll_top();
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Tab => {
@@ -1346,9 +1553,54 @@ fn run_app<B: Backend>(
                     KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
                         app.conns.scroll_down();
                     }
+                    KeyCode::Char('o') => {
+                        // Rotate the sort column to the next one available in this view.
+                        let order: &[SortKey] = if app.aggregate {
+                            &AGG_SORT_ORDER
+                        } else {
+                            &DETAIL_SORT_ORDER
+                        };
+                        app.sort_key = match order.iter().position(|k| *k == app.sort_key) {
+                            Some(pos) => order[(pos + 1) % order.len()],
+                            None => order[0],
+                        };
+                        app.sort_asc = false; // newest column starts descending
+                        app.conns.scroll_top();
+                    }
+                    KeyCode::Char('O') => {
+                        // Toggle sort direction on the current column.
+                        app.sort_asc = !app.sort_asc;
+                        app.conns.scroll_top();
+                    }
                     _ => {}
                 }
             }
+            Event::Mouse(me) => {
+                // Left-click on a column title re-sorts by that column; clicking the
+                // active column again flips the direction.
+                if !app.filter_mode {
+                    if let MouseEventKind::Down(MouseButton::Left) = me.kind {
+                        if me.row == app.header_y {
+                            for &(xs, xe, key) in &app.col_hit {
+                                if me.column >= xs && me.column < xe {
+                                    if app.sort_key == key {
+                                        app.sort_asc = !app.sort_asc;
+                                    } else {
+                                        app.sort_key = key;
+                                        app.sort_asc = false;
+                                    }
+                                    app.conns.scroll_top();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Event::Resize(_, _) => {}
+            // Focus / paste events are irrelevant to the UI; ignore them.
+            Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+        }
         }
 
         // Tick if enough time has passed.
@@ -1429,6 +1681,57 @@ mod tests {
         // Filter that matches nothing.
         app.filter = "zzz".into();
         term.draw(|f| ui(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn sorts_aggregate_rows_by_column() {
+        fn agg(cpu: f64, mem: f64, user: &str) -> ConnRow {
+            ConnRow::Agg(AggRow {
+                comm: "x".into(),
+                pid: Some(1),
+                count: 1,
+                rx_rate: 0.0,
+                tx_rate: 0.0,
+                user: user.to_string(),
+                time_secs: 0.0,
+                cpu_pct: cpu,
+                mem_pct: mem,
+            })
+        }
+        let mut rows = vec![agg(10.0, 1.0, "bob"), agg(50.0, 5.0, "amy"), agg(30.0, 3.0, "cara")];
+
+        // CPU% descending: 50, 30, 10.
+        sort_rows(&mut rows, SortKey::Cpu, false);
+        let cpus: Vec<f64> = rows
+            .iter()
+            .map(|r| match r {
+                ConnRow::Agg(a) => a.cpu_pct,
+                _ => 0.0,
+            })
+            .collect();
+        assert_eq!(cpus, vec![50.0, 30.0, 10.0]);
+
+        // CPU% ascending: 10, 30, 50.
+        sort_rows(&mut rows, SortKey::Cpu, true);
+        let cpus: Vec<f64> = rows
+            .iter()
+            .map(|r| match r {
+                ConnRow::Agg(a) => a.cpu_pct,
+                _ => 0.0,
+            })
+            .collect();
+        assert_eq!(cpus, vec![10.0, 30.0, 50.0]);
+
+        // USER ascending alphabetically: amy, bob, cara.
+        sort_rows(&mut rows, SortKey::User, true);
+        let users: Vec<String> = rows
+            .iter()
+            .map(|r| match r {
+                ConnRow::Agg(a) => a.user.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(users, vec!["amy", "bob", "cara"]);
     }
 
     #[test]
