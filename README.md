@@ -216,8 +216,11 @@ Two more ways to cope with a long list:
   └────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
   ```
 
-  - **USER** — the process owner, resolved from `/proc/<pid>/status` `Uid` via the
-    system password database (`getpwuid_r`). Shows `-` if it cannot be read.
+  - **USER** — the process owner, resolved from `/proc/<pid>/status` `Uid`. The
+    lookup first tries the in-process `getpwuid_r` (covers `/etc/passwd`) and, when
+    that yields only the numeric uid, falls back to `getent passwd <uid>` so accounts
+    provided by NSS modules (ldap/sssd/systemd) are resolved as well. Shows `-` if it
+    cannot be read.
   - **CPU%** — the process's CPU usage as a percentage of one core, measured over
     the sampling interval from `/proc/<pid>/stat` (`utime` + `stime` delta).
   - **MEM%** — the process's resident memory (`VmRSS`) as a percentage of total RAM
@@ -285,5 +288,5 @@ Cargo.toml       package manifest (ratatui 0.29, crossterm 0.28)
 
 ## License
 
-No license file is present in this repository. Add one before distributing the
-project.
+Licensed under the [MIT License](LICENSE). See the [LICENSE](LICENSE) file for
+the full text.
