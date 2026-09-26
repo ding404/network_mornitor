@@ -898,7 +898,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(23), // top: title + stats box (DL/UL/CPU/MEM) + footer
+                Constraint::Length(31), // top: title + stats box (DL/UL/CPU/MEM/DISK R/DISK W) + footer
                 Constraint::Min(5),     // bottom: top connections
             ])
             .split(area);
@@ -959,25 +959,29 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     let stats_inner = stats_block.inner(main_layout[1]);
     f.render_widget(stats_block, main_layout[1]);
 
-    // Rows: [DL (3)] [div] [UL (3)] [div] [CPU (3)] [div] [MEM (3)] [div]
-    //       [DISK R (3)] [div] [DISK W (3)] [time-axis baseline (1)] [time labels (1)].
+    // Six metric rows (DL, UL, CPU, MEM, DISK R, DISK W) of *equal* height,
+    // plus dividers between them and the time-axis baseline + labels row. The
+    // per-metric height is derived from the actual available space so every
+    // waveform block stays the same height. (A fixed `Length(3)` per metric
+    // would be shrunk unevenly by ratatui when the box is shorter than the
+    // sum — it keeps the first and last rows at full height and squeezes the
+    // middle ones — which looked inconsistent.)
+    let n_metrics = 6;
+    let sep_rows = (n_metrics - 1) as i32 + 2; // 5 dividers + axis baseline + labels
+    let inner_h = stats_inner.height as i32;
+    let metric_h = (((inner_h - sep_rows).max(0)) / n_metrics as i32).max(1) as u16;
+    let mut vcons: Vec<Constraint> = Vec::with_capacity(n_metrics * 2 + 1);
+    for i in 0..n_metrics {
+        vcons.push(Constraint::Length(metric_h));
+        if i + 1 < n_metrics {
+            vcons.push(Constraint::Length(1));
+        }
+    }
+    vcons.push(Constraint::Length(1)); // axis baseline
+    vcons.push(Constraint::Length(1)); // time labels
     let vrows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
+        .constraints(vcons)
         .split(stats_inner);
 
     // Download: [label | vdiv | sparkline].
