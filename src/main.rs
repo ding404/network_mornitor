@@ -588,9 +588,9 @@ fn format_speed(bytes_per_sec: u64) -> String {
         unit_idx += 1;
     }
     if unit_idx == 0 {
-        format!("{:>6.0} {}", value, UNITS[unit_idx])
+        format!("{} {}", value as u64, UNITS[unit_idx])
     } else {
-        format!("{:>6.1} {}", value, UNITS[unit_idx])
+        format!("{:.1} {}", value, UNITS[unit_idx])
     }
 }
 
@@ -1388,26 +1388,26 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
     let widths: Vec<Constraint> = if app.aggregate {
         vec![
             Constraint::Length(8),  // USER
-            Constraint::Length(24), // PROC(PID)
-            Constraint::Length(16), // CPU%
-            Constraint::Length(16), // MEM%
+            Constraint::Length(20), // PROC(PID)
+            Constraint::Length(8),  // CPU%
+            Constraint::Length(8),  // MEM%
             Constraint::Length(10), // TIME+
             Constraint::Length(6),  // CONNS
-            Constraint::Length(11), // RX
-            Constraint::Length(11), // TX
-            Constraint::Length(11), // DISKR
-            Constraint::Length(11), // DISKW
+            Constraint::Length(12), // RX
+            Constraint::Length(12), // TX
+            Constraint::Length(12), // DISKR
+            Constraint::Length(12), // DISKW
         ]
     } else {
         vec![
-            Constraint::Min(14),
-            Constraint::Length(4),
-            Constraint::Min(13),
-            Constraint::Min(13),
-            Constraint::Min(12),
-            Constraint::Length(7),
-            Constraint::Length(9),
-            Constraint::Length(9),
+            Constraint::Length(20), // PROC(PID)
+            Constraint::Length(4),  // PRO
+            Constraint::Length(19), // SRC
+            Constraint::Length(19), // DST
+            Constraint::Length(14), // HOST
+            Constraint::Length(7),  // SVC
+            Constraint::Length(12), // RX
+            Constraint::Length(12), // TX
         ]
     };
 
@@ -1495,8 +1495,8 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
                     Row::new(vec![
                         Cell::from(a.user.clone()),
                         Cell::from(proc),
-                        Cell::from(format!("{:>6.1}%", a.cpu_pct)),
-                        Cell::from(format!("{:>6.1}%", a.mem_pct)),
+                        Cell::from(format!("{:.1}%", a.cpu_pct)),
+                        Cell::from(format!("{:.1}%", a.mem_pct)),
                         Cell::from(fmt_time_plus(a.time_secs)),
                         Cell::from(a.count.to_string()),
                         Cell::from(format_speed(a.rx_rate as u64)),
