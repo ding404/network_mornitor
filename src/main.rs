@@ -1,10 +1,10 @@
 mod conns;
 use conns::{AggRow, ConnMonitor, ConnStat};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -16,18 +16,32 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame, Terminal,
 };
 
+/// Asia/Shanghai is UTC+8 with no daylight-saving time, so its offset from UTC
+/// is a constant 8 hours. Convert a UNIX timestamp (UTC seconds) into Shanghai
+/// wall-clock `(hour, minute, second)`. Using a fixed offset keeps the display
+/// independent of whatever timezone the host happens to be configured for.
+fn shanghai_hms(utc_secs: u64) -> (u32, u32, u32) {
+    const SHANGHAI_OFFSET: u64 = 8 * 3600;
+    let local = utc_secs + SHANGHAI_OFFSET;
+    let h = (local / 3600) % 24;
+    let m = (local / 60) % 60;
+    let s = local % 60;
+    (h as u32, m as u32, s as u32)
+}
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Maximum number of data points stored in history (5 minutes at 1s interval).
-const MAX_HISTORY: usize = 300;
-/// How many data points to display in the sparkline waveform.
-const SPARKLINE_POINTS: usize = 120;
-/// Refresh interval in milliseconds.
-const TICK_MS: u64 = 1000;
+/// Maximum number of data points stored in history (1 day at 0.5s interval).
+/// 86400 s/day × 2 samples/s = 172800. The full buffer is also the X-axis
+/// window shown on the waveform.
+const MAX_HISTORY: usize = 172800;
+/// Refresh interval in milliseconds. 500 ms → 2 samples/sec, so a 1-second
+/// judging window contains 2 samples of accumulated traffic.
+const TICK_MS: u64 = 500;
 /// Background tint for alternating rows in the connections table (zebra striping).
 const ZEBRA: Color = Color::Rgb(34, 34, 44);
 
@@ -56,6 +70,20 @@ struct App {
     prev_tx_bytes: u64,
     /// Timestamp of the last sample.
     last_sample: Instant,
+    /// Previous raw (rx_bytes, tx_bytes) per interface, for computing each
+    /// interface's own throughput without switching the active one.
+    prev_counters: HashMap<String, (u64, u64)>,
+    /// Accumulated (rx+tx) bytes per interface over the current 1-second judging
+    /// window, used to pick the busiest interface without reacting to spikes.
+    auto_window_bytes: HashMap<String, u64>,
+    /// Start of the current 1-second judging window.
+    auto_window_start: Instant,
+    /// Whether to automatically switch to the busiest interface.
+    auto_iface: bool,
+    /// Earliest time the next automatic interface switch may happen (debounce).
+    last_auto_switch: Instant,
+    /// Last time per-connection throughput was sampled (kept at ~2 Hz).
+    last_conns_sample: Instant,
     /// Per-connection / per-process throughput monitor.
     conns: ConnMonitor,
     /// Focus mode: the connections panel fills the whole screen.
@@ -82,6 +110,12 @@ impl App {
             prev_rx_bytes: 0,
             prev_tx_bytes: 0,
             last_sample: Instant::now(),
+            prev_counters: HashMap::new(),
+            auto_window_bytes: HashMap::new(),
+            auto_window_start: Instant::now(),
+            auto_iface: true,
+            last_auto_switch: Instant::now(),
+            last_conns_sample: Instant::now(),
             conns: ConnMonitor::new(),
             focus_conns: false,
             aggregate: false,
@@ -114,19 +148,100 @@ impl App {
         ))
     }
 
-    /// Take a sample: read counters, compute delta, push to history.
+    /// Read raw (rx_bytes, tx_bytes) for *every* interface from /proc/net/dev.
+    fn read_all_counters(&self) -> io::Result<HashMap<String, (u64, u64)>> {
+        let content = fs::read_to_string("/proc/net/dev")?;
+        let mut map = HashMap::new();
+        for line in content.lines().skip(2) {
+            let line = line.trim();
+            if let Some(colon) = line.find(':') {
+                let iface = line[..colon].trim().to_string();
+                let rest = &line[colon + 1..];
+                let fields: Vec<&str> = rest.split_whitespace().collect();
+                if fields.len() >= 9 {
+                    let rx: u64 = fields[0].parse().unwrap_or(0);
+                    let tx: u64 = fields[8].parse().unwrap_or(0);
+                    map.insert(iface, (rx, tx));
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    /// Return the interface (from the known list) with the most traffic accumulated
+    /// in the current 1-second window, or None if nothing is accumulated yet. Ties
+    /// resolve to the first match, which keeps the current interface when it is
+    /// among the joint-busiest.
+    fn busiest_iface(&self) -> Option<String> {
+        let mut best: Option<&String> = None;
+        let mut best_total = 0u64;
+        for (iface, &bytes) in &self.auto_window_bytes {
+            if bytes > best_total {
+                best_total = bytes;
+                best = Some(iface);
+            }
+        }
+        best.cloned()
+    }
+
+    /// Switch to the busiest interface (by accumulated 1s traffic) if auto mode is
+    /// on, the 1s debounce has elapsed, and a different interface is clearly ahead.
+    /// The +4096 byte margin (4 KB/s) avoids thrashing between similar loads.
+    fn auto_switch_if_needed(&mut self, now: Instant) {
+        if !self.auto_iface
+            || now.duration_since(self.last_auto_switch) <= Duration::from_secs(1)
+        {
+            return;
+        }
+        let best = match self.busiest_iface() {
+            Some(b) => b,
+            None => return,
+        };
+        let cur_bytes = self.auto_window_bytes.get(&self.iface).copied().unwrap_or(0);
+        let best_bytes = self.auto_window_bytes.get(&best).copied().unwrap_or(0);
+        if best != self.iface && best_bytes > cur_bytes + 4096 {
+            if let Some(idx) = self.ifaces.iter().position(|n| n == &best) {
+                self.switch_iface(idx);
+                self.last_auto_switch = now;
+            }
+        }
+    }
+
+    /// Take a sample: read all counters, accumulate per-interface traffic into a
+    /// 1-second window, and (optionally) auto-switch to the busiest interface once
+    /// that window elapses.
     fn tick(&mut self) -> io::Result<()> {
-        let (rx_bytes, tx_bytes) = self.read_counters()?;
         let now = Instant::now();
+        let counters = self.read_all_counters()?;
         let elapsed = now.duration_since(self.last_sample).as_secs_f64();
+        let ifaces = self.ifaces.clone();
 
-        if elapsed > 0.0 && self.prev_rx_bytes > 0 {
-            // Compute bytes/s (handle counter wrap with saturating sub).
-            let rx_delta = rx_bytes.saturating_sub(self.prev_rx_bytes);
-            let tx_delta = tx_bytes.saturating_sub(self.prev_tx_bytes);
+        // Compute each interface's byte delta this tick; feed it to the 1-second
+        // judging window and derive the active interface's instantaneous rate.
+        for iface in &ifaces {
+            if let Some(&(rx, tx)) = counters.get(iface) {
+                let (prev_rx, prev_tx) = self.prev_counters.get(iface).copied().unwrap_or((0, 0));
+                // Guard against the first sample (no baseline yet) to avoid counting
+                // all traffic since boot as a single delta.
+                let d_rx = if prev_rx > 0 { rx.saturating_sub(prev_rx) } else { 0 };
+                let d_tx = if prev_tx > 0 { tx.saturating_sub(prev_tx) } else { 0 };
+                if iface == &self.iface && elapsed > 0.0 && prev_rx > 0 {
+                    self.current_rx = (d_rx as f64 / elapsed) as u64;
+                    self.current_tx = (d_tx as f64 / elapsed) as u64;
+                }
+                *self.auto_window_bytes.entry(iface.clone()).or_insert(0) += d_rx + d_tx;
+                self.prev_counters.insert(iface.clone(), (rx, tx));
+            }
+        }
 
-            self.current_rx = (rx_delta as f64 / elapsed) as u64;
-            self.current_tx = (tx_delta as f64 / elapsed) as u64;
+        // Once the 1-second window has elapsed, judge the busiest interface from the
+        // accumulated traffic and reset the window for the next round.
+        if now.duration_since(self.auto_window_start) >= Duration::from_secs(1) {
+            self.auto_switch_if_needed(now);
+            for v in self.auto_window_bytes.values_mut() {
+                *v = 0;
+            }
+            self.auto_window_start = now;
         }
 
         // Push to history ring buffers.
@@ -145,12 +260,18 @@ impl App {
             .max(self.current_rx)
             .max(self.current_tx);
 
-        self.prev_rx_bytes = rx_bytes;
-        self.prev_tx_bytes = tx_bytes;
+        if let Some(&(rx, tx)) = counters.get(&self.iface) {
+            self.prev_rx_bytes = rx;
+            self.prev_tx_bytes = tx;
+        }
         self.last_sample = now;
 
-        // Sample per-connection throughput (non-fatal on failure).
-        let _ = self.conns.sample();
+        // Per-connection throughput is sampled at its own slower cadence (~2 Hz)
+        // so we don't run `ss` on every main tick.
+        if now.duration_since(self.last_conns_sample) >= Duration::from_millis(500) {
+            let _ = self.conns.sample();
+            self.last_conns_sample = now;
+        }
 
         Ok(())
     }
@@ -175,10 +296,13 @@ impl App {
         if let Ok((rx, tx)) = self.read_counters() {
             self.prev_rx_bytes = rx;
             self.prev_tx_bytes = tx;
+            self.prev_counters.insert(self.iface.clone(), (rx, tx));
         } else {
             self.prev_rx_bytes = 0;
             self.prev_tx_bytes = 0;
+            self.prev_counters.insert(self.iface.clone(), (0, 0));
         }
+        // The first sample on the new interface must read 0, not a delta spike.
         self.last_sample = Instant::now();
     }
 
@@ -187,7 +311,7 @@ impl App {
         let window: Vec<&u64> = history
             .iter()
             .rev()
-            .take(SPARKLINE_POINTS)
+            .take(MAX_HISTORY)
             .collect();
         let max = window.iter().fold(1u64, |acc, &&v| acc.max(v));
         (max as f64 * 1.1) as u64 + 1
@@ -260,34 +384,168 @@ fn format_speed(bytes_per_sec: u64) -> String {
     }
 }
 
-/// Render a titled sparkline block for a history buffer.
-fn render_sparkline(
+/// Format a fraction as a right-aligned percentage (e.g. `" 12.3"`).
+fn fmt_pct(v: f64) -> String {
+    format!("{:>5.1}", v)
+}
+
+/// Format cumulative CPU time the way htop's `TIME+` does: `MM:SS.cc` below an
+/// hour, `HH:MM:SS` at or above an hour (centiseconds dropped).
+fn fmt_time_plus(secs: f64) -> String {
+    let total_cs = (secs * 100.0).round() as u64;
+    let cs = total_cs % 100;
+    let total_s = total_cs / 100;
+    let ss = total_s % 60;
+    let mm = (total_s / 60) % 60;
+    let hh = total_s / 3600;
+    if hh > 0 {
+        format!("{:02}:{:02}:{:02}", hh, mm, ss)
+    } else {
+        format!("{:02}:{:02}.{:02}", mm, ss, cs)
+    }
+}
+
+/// Draw a smoothed waveform as a continuous braille line. Each character cell
+/// carries a 2x4 dot matrix, so consecutive samples connect into one curve
+/// instead of the 8-level stepped bars the `Sparkline` widget produces. A
+/// 3-point moving average rounds the curve and flattens single-sample spikes.
+fn draw_waveform(
     f: &mut Frame,
     area: Rect,
-    title: &str,
     history: &VecDeque<u64>,
     max: u64,
     color: Color,
 ) {
-    let data: Vec<u64> = history
+    if area.width == 0 || area.height == 0 || history.is_empty() || max == 0 {
+        return;
+    }
+    let width = area.width as usize;
+    let height = area.height as usize; // braille character rows
+    let xres = width * 2; // 2 horizontal dots per cell
+    let yres = height * 4; // 4 vertical dots per cell
+
+    let n = history.len();
+
+    // Normalised series (0..1) over the whole buffer.
+    let data: Vec<f64> = history
         .iter()
-        .rev()
-        .take(SPARKLINE_POINTS)
-        .rev()
-        .copied()
+        .map(|&v| (v as f64 / max as f64).clamp(0.0, 1.0))
         .collect();
 
-    let sparkline = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD))),
-        )
-        .data(&data)
-        .max(max)
-        .style(Style::default().fg(color));
+    // 3-point moving average for a rounder curve.
+    let smoothed: Vec<f64> = (0..n)
+        .map(|i| {
+            let a = data[if i > 0 { i - 1 } else { i }];
+            let b = data[i];
+            let c = data[if i + 1 < n { i + 1 } else { i }];
+            (a + b + c) / 3.0
+        })
+        .collect();
 
-    f.render_widget(sparkline, area);
+    // Dynamic X scale. The currently-available samples are stretched across the
+    // full chart width, so the (initially very sparse) waveform is always clearly
+    // visible instead of being crammed into a sliver at the left edge of a 24h
+    // window. As history accumulates the window grows until it spans the full
+    // MAX_HISTORY (1 day) and the chart "zooms out" to show the whole day, after
+    // which it scrolls as new samples arrive.
+    let shown = (n as f64).min(MAX_HISTORY as f64);
+    let span = (shown - 1.0).max(1.0);
+    let x_of = |i: usize| -> f64 {
+        i as f64 * (xres - 1) as f64 / span
+    };
+    let y_of = |val: f64| -> i32 {
+        ((1.0 - val) * (yres - 1) as f64).round() as i32
+    };
+
+    // Dot grid: one bool per (x, y) dot. We render a *hollow* line, so we first
+    // reduce the (possibly huge) sample buffer to one representative value per
+    // horizontal dot column. This keeps the curve exactly one dot thick no matter
+    // how many samples compress into a column — a 24h buffer (172800 samples)
+    // would otherwise fill every column solid and read as a block rather than a
+    // line. Value 0 -> bottom, value 1 -> top.
+    let xr = (xres as f64 - 1.0).max(1.0);
+    let mut col_val: Vec<Option<f64>> = vec![None; xres];
+    for dx in 0..xres {
+        // Which sample index sits closest to this dot column's centre?
+        let sample_f = dx as f64 * span / xr;
+        let i0 = sample_f.floor() as i32;
+        let i1 = sample_f.ceil() as i32;
+        let mut best: Option<(f64, f64)> = None; // (distance, value)
+        for &i in &[i0, i1] {
+            if i >= 0 && (i as usize) < n {
+                let d = (x_of(i as usize) - dx as f64).abs();
+                let better = match best {
+                    None => true,
+                    Some((bd, _)) => d < bd,
+                };
+                if better {
+                    best = Some((d, smoothed[i as usize]));
+                }
+            }
+        }
+        if let Some((_, v)) = best {
+            col_val[dx] = Some(v);
+        }
+    }
+
+    let mut dots = vec![false; xres * yres];
+    let points: Vec<(i32, i32)> = col_val
+        .iter()
+        .enumerate()
+        .filter_map(|(dx, v)| v.map(|val| (dx as i32, y_of(val))))
+        .collect();
+
+    if points.len() == 1 {
+        let (x, y) = points[0];
+        if x >= 0 && x < xres as i32 && y >= 0 && y < yres as i32 {
+            dots[y as usize * xres + x as usize] = true;
+        }
+    } else {
+        for k in 0..points.len().saturating_sub(1) {
+            let (x0, y0) = points[k];
+            let (x1, y1) = points[k + 1];
+            let steps = ((x1 - x0).abs()).max(1) as i32;
+            for s in 0..=steps {
+                let t = s as f64 / steps as f64;
+                let x = (x0 as f64 + (x1 - x0) as f64 * t).round() as i32;
+                let y = (y0 as f64 + (y1 - y0) as f64 * t).round() as i32;
+                if x >= 0 && x < xres as i32 && y >= 0 && y < yres as i32 {
+                    dots[y as usize * xres + x as usize] = true;
+                }
+            }
+        }
+    }
+
+    // Paint braille characters into the buffer.
+    let buf = f.buffer_mut();
+    for cy in 0..height {
+        for cx in 0..width {
+            let mut bits: u32 = 0;
+            for dy in 0..4 {
+                for dx in 0..2 {
+                    if dots[(cy * 4 + dy) * xres + (cx * 2 + dx)] {
+                        let bit = match (dx, dy) {
+                            (0, 0) => 0,
+                            (0, 1) => 1,
+                            (0, 2) => 2,
+                            (1, 0) => 3,
+                            (1, 1) => 4,
+                            (1, 2) => 5,
+                            (0, 3) => 6,
+                            (1, 3) => 7,
+                            _ => 0,
+                        };
+                        bits |= 1 << bit;
+                    }
+                }
+            }
+            let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
+            let cell = &mut buf[(area.x + cx as u16, area.y + cy as u16)];
+            let s = ch.to_string();
+            cell.set_symbol(&s);
+            cell.set_style(Style::default().fg(color));
+        }
+    }
 }
 
 /// Render UI.
@@ -305,8 +563,8 @@ fn ui(f: &mut Frame, app: &mut App) {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Percentage(60), // top: gauges + waveforms
-                Constraint::Percentage(40), // bottom: top connections
+                Constraint::Length(15), // top: title + compact stats + footer
+                Constraint::Min(5),     // bottom: top connections
             ])
             .split(area);
         render_top(f, outer[0], app);
@@ -319,15 +577,13 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // title
-            Constraint::Length(6),  // gauges
-            Constraint::Min(3),     // download waveform
-            Constraint::Min(3),     // upload waveform
-            Constraint::Length(1),  // footer
+            Constraint::Length(3), // title
+            Constraint::Length(11), // compact stats box (DL/UL + time axis)
+            Constraint::Length(1), // footer
         ])
         .split(area);
 
-    // ── Title bar ────────────────────────────────────────────────────────
+    // ── Title bar (unchanged) ────────────────────────────────────────────
     let title = Paragraph::new(Line::from(vec![
         Span::styled("◉ Network Monitor", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("  │  "),
@@ -343,6 +599,8 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("  │  "),
         Span::styled("n/p: iface", Style::default().fg(Color::DarkGray)),
         Span::raw("  │  "),
+        Span::styled("i: auto-iface", Style::default().fg(Color::DarkGray)),
+        Span::raw("  │  "),
         Span::styled("r: reset", Style::default().fg(Color::DarkGray)),
         Span::raw("  │  "),
         Span::styled("q: quit", Style::default().fg(Color::DarkGray)),
@@ -350,76 +608,163 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, main_layout[0]);
 
-    // ── Speed gauges ─────────────────────────────────────────────────────
-    let gauge_area = main_layout[1];
-    let gauge_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(gauge_area);
-
-    // Download gauge.
-    let rx_ratio = if app.peak_speed > 0 {
-        app.current_rx as f64 / app.peak_speed as f64
-    } else {
-        0.0
-    };
-    let rx_gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    " ▼ DOWNLOAD ",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                )),
-        )
-        .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
-        .ratio(rx_ratio.clamp(0.0, 1.0))
-        .label(format!(" {} ", format_speed(app.current_rx)));
-    f.render_widget(rx_gauge, gauge_layout[0]);
-
-    // Upload gauge.
-    let tx_ratio = if app.peak_speed > 0 {
-        app.current_tx as f64 / app.peak_speed as f64
-    } else {
-        0.0
-    };
-    let tx_gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    " ▲ UPLOAD ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                )),
-        )
-        .gauge_style(Style::default().fg(Color::Red).bg(Color::DarkGray))
-        .ratio(tx_ratio.clamp(0.0, 1.0))
-        .label(format!(" {} ", format_speed(app.current_tx)));
-    f.render_widget(tx_gauge, gauge_layout[1]);
-
-    // ── Waveforms ────────────────────────────────────────────────────────
+    // ── Compact stats: one bordered box holding DL/UL labels + sparklines,
+    //    with a horizontal divider between DL/UL and a vertical divider
+    //    between each label and its waveform. ──────────────────────────────
+    let window_h = MAX_HISTORY as f64 * TICK_MS as f64 / 1000.0 / 3600.0;
     let rx_max = app.sparkline_max(&app.rx_history);
     let tx_max = app.sparkline_max(&app.tx_history);
 
-    render_sparkline(
-        f,
-        main_layout[2],
-        &format!(" ▼ Download History ({:.0}s) ", SPARKLINE_POINTS),
-        &app.rx_history,
-        rx_max,
-        Color::Green,
-    );
+    let stats_block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" ▼ Download / ▲ Upload History ({:.0}h) ", window_h),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    let stats_inner = stats_block.inner(main_layout[1]);
+    f.render_widget(stats_block, main_layout[1]);
 
-    render_sparkline(
-        f,
-        main_layout[3],
-        &format!(" ▲ Upload History ({:.0}s) ", SPARKLINE_POINTS),
-        &app.tx_history,
-        tx_max,
-        Color::Red,
-    );
+    // Rows: [Download (3)] [divider (1)] [Upload (3)] [time-axis ticks (1)] [time labels (1)].
+    let vrows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(stats_inner);
 
-    // ── Footer ───────────────────────────────────────────────────────────
+    // Download: [label | vdiv | sparkline].
+    let dl = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .split(vrows[0]);
+    let dl_label = Paragraph::new(Line::from(Span::styled(
+        format!("▼ DL {}", format_speed(app.current_rx)),
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(dl_label, dl[0]);
+    draw_waveform(f, dl[2], &app.rx_history, rx_max, Color::Green);
+
+    // Upload: [label | vdiv | sparkline].
+    let ul = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .split(vrows[2]);
+    let ul_label = Paragraph::new(Line::from(Span::styled(
+        format!("▲ UL {}", format_speed(app.current_tx)),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(ul_label, ul[0]);
+    draw_waveform(f, ul[2], &app.tx_history, tx_max, Color::Red);
+
+    // Draw the grid dividers directly into the buffer so the vertical and
+    // horizontal lines join into a clean cross.
+    let buf = f.buffer_mut();
+    let vline_x = dl[1].x;
+    let hline_y = vrows[1].y;
+    let grid_style = Style::default().fg(Color::DarkGray);
+    for y in stats_inner.y..stats_inner.y + stats_inner.height {
+        let cell = &mut buf[(vline_x, y)];
+        cell.set_symbol("│");
+        cell.set_style(grid_style);
+    }
+    for x in stats_inner.x..stats_inner.x + stats_inner.width {
+        let cell = &mut buf[(x, hline_y)];
+        cell.set_symbol("─");
+        cell.set_style(grid_style);
+    }
+    let cross = &mut buf[(vline_x, hline_y)];
+    cross.set_symbol("┼");
+    cross.set_style(grid_style);
+
+    // Baseline for the bottom time axis (horizontal line under the UL waveform),
+    // with the time labels drawn below it.
+    let axis_y = vrows[3].y;
+    for x in stats_inner.x..stats_inner.x + stats_inner.width {
+        let cell = &mut buf[(x, axis_y)];
+        cell.set_symbol("─");
+        cell.set_style(grid_style);
+    }
+    let axis_cross = &mut buf[(vline_x, axis_y)];
+    axis_cross.set_symbol("┼");
+    axis_cross.set_style(grid_style);
+
+    // ── Time scale on the X axis ─────────────────────────────────────────────
+    // A `now HH:MM:SS` label is printed at the right edge (newest sample =
+    // current time). Adaptive `HH:MM` labels are placed below the axis; the
+    // number shown scales with the available width so they never overlap. All
+    // times are rendered in Asia/Shanghai (UTC+8) via `shanghai_hms`.
+    let n = app.rx_history.len();
+    if n >= 2 {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let label_style = Style::default().fg(Color::Gray);
+
+        // Seconds of history currently shown on the (dynamic) axis.
+        let window_seconds = ((n as f64 - 1.0) * TICK_MS as f64 / 1000.0).max(1.0);
+        let xres = dl[2].width as usize * 2; // dots, matches draw_waveform
+        let xres_f = (xres as f64 - 1.0).max(0.0);
+        let mut last_label_x: i32 = i32::MIN / 2;
+        let mut last_label_text = String::new();
+
+        // Dynamically choose how many of the 288 tick positions get a text label
+        // so they always have room: aim for one label roughly every 8 columns of
+        // axis width. Wide terminals show many labels; narrow ones show few.
+        let axis_cols = dl[2].width as i32;
+        let max_labels = (axis_cols / 8).max(2);
+        let step = ((288 + max_labels - 1) / max_labels).max(1); // ceil(288/max_labels)
+
+        for k in 0..=288 {
+            let f = k as f64 / 288.0; // 0 = oldest (left), 1 = newest (right)
+            let xpix = f * xres_f;
+            let gx = dl[2].x + (xpix.round() as usize / 2) as u16;
+
+            // Time label at every `step`-th position; skip the right edge because
+            // the "now" label already marks it, and skip a label that repeats the
+            // previous one (happens when the time window is still tiny).
+            if k % step == 0 && k != 288 {
+                let t = now_secs - ((1.0 - f) * window_seconds) as u64;
+                let (hh, mm, _) = shanghai_hms(t);
+                let label = format!("{:02}:{:02}", hh, mm);
+                let lx = gx.saturating_sub(2) as i32;
+                if lx >= stats_inner.x as i32
+                    && (lx + label.len() as i32) <= stats_inner.x as i32 + stats_inner.width as i32
+                    && lx - last_label_x >= label.len() as i32 + 2
+                    && label != last_label_text
+                {
+                    for (i, ch) in label.chars().enumerate() {
+                        let c = &mut buf[(lx as u16 + i as u16, vrows[4].y)];
+                        c.set_symbol(&ch.to_string());
+                        c.set_style(label_style);
+                    }
+                    last_label_x = lx;
+                    last_label_text = label;
+                }
+            }
+        }
+
+        // Current system time (Asia/Shanghai) at the right edge of the axis.
+        let (now_h, now_m, now_s) = shanghai_hms(now_secs);
+        let now_label = format!("now {:02}:{:02}:{:02}", now_h, now_m, now_s);
+        let nlen = now_label.len() as u16;
+        let nlx = stats_inner.x + stats_inner.width.saturating_sub(nlen + 1);
+        if nlx >= stats_inner.x
+            && nlx + nlen <= stats_inner.x + stats_inner.width
+        {
+            for (i, ch) in now_label.chars().enumerate() {
+                let cell = &mut buf[(nlx + i as u16, vrows[4].y)];
+                cell.set_symbol(&ch.to_string());
+                cell.set_style(label_style);
+            }
+        }
+    }
+
+    // ── Footer ──────────────────────────────────────────────────────────
     let peak_str = format!("Session peak: {}", format_speed(app.peak_speed));
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(peak_str, Style::default().fg(Color::DarkGray)),
@@ -428,8 +773,17 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
             format!("Samples: {}", app.rx_history.len()),
             Style::default().fg(Color::DarkGray),
         ),
+        Span::raw("  │  "),
+        Span::styled(
+            format!("auto: {}", if app.auto_iface { "on" } else { "off" }),
+            Style::default().fg(if app.auto_iface {
+                Color::Green
+            } else {
+                Color::DarkGray
+            }),
+        ),
     ]));
-    f.render_widget(footer, main_layout[4]);
+    f.render_widget(footer, main_layout[2]);
 }
 
 /// One row in the connections table, in either detail (per-socket) or
@@ -489,8 +843,10 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let header = if app.aggregate {
-        Row::new(vec!["PROC(PID)", "CONNS", "RX", "TX"])
-            .style(Style::default().add_modifier(Modifier::BOLD))
+        Row::new(vec![
+            "USER", "PROC(PID)", "CPU%", "MEM%", "TIME+", "CONNS", "RX", "TX",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD))
     } else {
         Row::new(vec!["PROC(PID)", "PRO", "SRC", "DST", "HOST", "SVC", "RX", "TX"])
             .style(Style::default().add_modifier(Modifier::BOLD))
@@ -515,7 +871,11 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
                         None => a.comm.clone(),
                     };
                     Row::new(vec![
+                        Cell::from(a.user.clone()),
                         Cell::from(proc),
+                        Cell::from(fmt_pct(a.cpu_pct)),
+                        Cell::from(fmt_pct(a.mem_pct)),
+                        Cell::from(fmt_time_plus(a.time_secs)),
                         Cell::from(a.count.to_string()),
                         Cell::from(format_speed(a.rx_rate as u64)),
                         Cell::from(format_speed(a.tx_rate as u64)),
@@ -554,10 +914,14 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
 
     let widths: Vec<Constraint> = if app.aggregate {
         vec![
-            Constraint::Min(20),
-            Constraint::Length(7),
-            Constraint::Length(11),
-            Constraint::Length(11),
+            Constraint::Length(8),  // USER
+            Constraint::Min(16),    // PROC(PID)
+            Constraint::Length(6),  // CPU%
+            Constraint::Length(6),  // MEM%
+            Constraint::Length(10), // TIME+
+            Constraint::Length(6),  // CONNS
+            Constraint::Length(11), // RX
+            Constraint::Length(11), // TX
         ]
     } else {
         vec![
@@ -695,15 +1059,24 @@ fn run_app<B: Backend>(
                         app.conns.scroll_top();
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Tab => {
-                        // Next interface (wrap around).
+                        // Next interface (wrap around). Manual control disables auto.
+                        app.auto_iface = false;
+                        app.last_auto_switch = Instant::now();
                         app.switch_iface(app.iface_idx + 1);
                     }
                     KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::BackTab => {
-                        // Previous interface (wrap around).
+                        // Previous interface (wrap around). Manual control disables auto.
+                        app.auto_iface = false;
+                        app.last_auto_switch = Instant::now();
                         let len = app.ifaces.len();
                         if len > 0 {
                             app.switch_iface(app.iface_idx + len - 1);
                         }
+                    }
+                    KeyCode::Char('i') | KeyCode::Char('I') => {
+                        // Toggle automatic switching to the busiest interface.
+                        app.auto_iface = !app.auto_iface;
+                        app.last_auto_switch = Instant::now();
                     }
                     KeyCode::PageUp => app.conns.scroll_page_up(),
                     KeyCode::PageDown => app.conns.scroll_page_down(),
@@ -798,6 +1171,48 @@ mod tests {
         // Filter that matches nothing.
         app.filter = "zzz".into();
         term.draw(|f| ui(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn auto_switches_to_busiest_interface() {
+        let mut app = sample_app();
+        app.ifaces = vec!["eth0".to_string(), "eth1".to_string()];
+        app.iface = "eth0".to_string();
+        app.iface_idx = 0;
+        app.auto_iface = true;
+        // Allow an immediate switch.
+        app.last_auto_switch = Instant::now() - Duration::from_secs(10);
+
+        // eth1 accumulated far more traffic over the 1s window.
+        app.auto_window_bytes.insert("eth0".to_string(), 0);
+        app.auto_window_bytes.insert("eth1".to_string(), 100_000);
+        app.current_rx = 0;
+        app.current_tx = 0;
+
+        app.auto_switch_if_needed(Instant::now());
+        assert_eq!(app.iface, "eth1");
+        assert_eq!(app.iface_idx, 1);
+
+        // A tiny margin (1000 bytes in 1s) must NOT trigger a switch -> no thrashing.
+        let mut app2 = sample_app();
+        app2.ifaces = vec!["eth0".to_string(), "eth1".to_string()];
+        app2.iface = "eth0".to_string();
+        app2.iface_idx = 0;
+        app2.auto_iface = true;
+        app2.last_auto_switch = Instant::now() - Duration::from_secs(10);
+        app2.auto_window_bytes.insert("eth0".to_string(), 0);
+        app2.auto_window_bytes.insert("eth1".to_string(), 1000);
+        app2.current_rx = 0;
+        app2.current_tx = 0;
+        app2.auto_switch_if_needed(Instant::now());
+        assert_eq!(app2.iface, "eth0", "should not thrash on a tiny margin");
+
+        // Auto off -> never switches.
+        let mut app3 = app2;
+        app3.auto_iface = false;
+        app3.auto_window_bytes.insert("eth1".to_string(), 100_000);
+        app3.auto_switch_if_needed(Instant::now());
+        assert_eq!(app3.iface, "eth0");
     }
 
     #[test]

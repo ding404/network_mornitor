@@ -4,22 +4,19 @@ A tiny terminal network monitor written in Rust. It shows live download and uplo
 speed for one network interface, with gauges and sparkline history charts.
 
 ```
-┌ ◉ Network Monitor ── interface: wlp2s0 (1/4) ── n/p:iface r:reset q:quit ┐
-│ ┌ ▼ DOWNLOAD ─────────┐ ┌ ▲ UPLOAD ──────────┐ │
-│ │    1.2 MB/s         │ │    128.0 KB/s     │ │
-│ └─────────────────────┘ └───────────────────┘ │
-│ ┌ ▼ Download History (120s) ──────────────────┐ │
-│ │      ▁▂▃▅▇▅▃▂▁▂▃▅▇█▇▅▃▂                     │ │
-│ └─────────────────────────────────────────────┘ │
-│ ┌ ▲ Upload History (120s) ────────────────────┐ │
-│ │      ▁▁▂▂▃▃▂▂▁▁▂▂▃▃▂▂                       │ │
-│ └─────────────────────────────────────────────┘ │
-│ Session peak: 5.4 MB/s  │  Samples: 300  │  ↑/↓:scroll conns           │
-├ Top Connections (by throughput) ────────────────────────────────────────────┤
+┌ ◉ Network Monitor  │  interface: wlp2s0  │  iface 1/4  │  n/p: iface  │  r: reset  │  q: quit ┐
+┌ ▼ Download / ▲ Upload History (24h) ─────────────────────────────────────────────┐
+┌ ▼ Download / ▲ Upload History (24h) ─────────────────────────────────────────────┐
+│ ▼ DL 1.2 MB/s  │⠀⠀⣀⡤⠖⠒⠒⠦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⠴⠒⠒⠲⢤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠴⠒⠒⠦⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡤⠖⠒⠒⠦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⠴⠒⠒⠲⢤⣀⠀⠀⠀⠀⠀⠀⠀│
+│ ▲ UL 128 KB/s  │⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡏⢹⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣰⠋⣇⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡼⢹⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡏⢧⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀│
+│ ▲ UL 128 KB/s  │⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦│
+│ Session peak: 5.4 MB/s  │  Samples: 600                                          │
+├ Top Connections (by throughput) ────────────────────────────────────────────────────┤
 │ PROC(PID)      PRO  SRC             DST             HOST       SVC    RX      TX   │
 │ node(26951)    tcp  127.0.0.1:51641 127.0.0.1:10808 localhost  -      6.1 KB/s 2.0 KB/s │
 │ sshd(882)      tcp  10.0.0.2:22     10.0.0.9:55123  9.9.9.9    ssh    12.0 KB/s 4.0 KB/s │
 │ resolver(1031) udp  127.0.0.53:53   8.8.8.8:53      dns.google domain n/a     n/a      │
+│   ...more rows now fit because the four stats regions are compact...              │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -39,9 +36,15 @@ The program also builds a list of every non-loopback interface in
 name an interface on the command line and it is not in the list, the program
 puts it at the front of the list.
 
-All samples are stored in two ring buffers of 300 entries, which covers 5 minutes
-at a 1-second tick. The sparklines draw the newest 120 points, so the waveform
-window is about 2 minutes.
+All samples are stored in two ring buffers of 172800 entries, which covers 1 day
+(24 hours) at a 0.5-second (2 Hz) tick. The waveform draws the full buffer, but the
+X-axis **scale is dynamic**: until a full day of history has accumulated, the
+available samples are stretched across the whole chart width so the (initially
+sparse) curve is always clearly visible instead of being crushed into a sliver at
+the left edge of a 24h window. As more history arrives the view gradually "zooms
+out" until it spans the full day, after which it scrolls as new samples come in.
+Because the line is one dot thick, it stays a thin *hollow* braille curve rather
+than a solid block even when the buffer is full.
 
 This tool is Linux-only because it depends on `/proc/net/dev` and
 `/proc/net/route`.
@@ -111,27 +114,39 @@ You can also run the built binary directly:
 | `a` | Toggle aggregate-by-process view (one row per process, with total rate and connection count) |
 | `q` / `Q` / `Esc` | Quit |
 | `r` / `R` | Reset history buffers, session peak, connection monitor and filter |
+| `i` / `I` | Toggle automatic switching to the busiest interface |
 
 Switching interfaces clears the history buffers, resets the session peak, and
 re-reads the counters of the new interface. This makes the first sample on the
 new interface a real measurement instead of a bogus delta between two different
 counters. The title bar shows the position in the list, for example `iface 2/4`.
 
+### Automatic interface selection
+
+By default the program watches every interface and, once per second, adds up the
+bytes transferred on each during that 1-second window (sampled twice at 2 Hz).
+The interface with the most accumulated traffic is selected automatically; the
+switch only happens when a *different* interface is ahead by more than ~4 KB/s, so
+two interfaces with similar load will not thrash back and forth. Manual switching
+with `n` / `p` turns auto mode off (shown as `auto: off` in the footer). Press `i`
+to toggle it back on.
+
 ## Display
 
 | Area | Meaning |
 | --- | --- |
 | Title bar | Program name, the interface in use, and its position in the list |
-| DOWNLOAD gauge | Current download speed in bytes/s (binary units) |
-| UPLOAD gauge | Current upload speed in bytes/s (binary units) |
-| Download History | Download speed sparkline, newest 120 samples |
-| Upload History | Upload speed sparkline, newest 120 samples |
-| Footer | Session peak speed and number of stored samples |
+| DOWNLOAD / UPLOAD box | Current DL/UL speed (bytes/s, binary units) on the left, with a hollow braille history waveform on the right spanning the last 24 hours (172800 samples @ 2 Hz) |
+| Download waveform | Hollow braille line of download speed over the dynamic 24-hour window |
+| Upload waveform | Hollow braille line of upload speed over the dynamic 24-hour window |
+| Footer | Session peak speed, number of stored samples, and auto-iface status (`auto: on/off`) |
 
-Gauge fill is relative to the session peak speed, which is the largest download
-or upload value seen since start or since the last reset. The sparkline scale is
-the maximum value inside its own 120-point window plus 10 percent headroom, so a
-sparkline rescales as traffic changes.
+The waveform scale is the maximum value inside the current window plus 10 percent
+headroom, so it rescales as traffic changes. The X-axis sits at the bottom of the
+chart: below the baseline a `now HH:MM:SS` label (right edge) and adaptive `HH:MM`
+time labels are drawn on the row beneath it. The number of `HH:MM` labels scales
+with the terminal width so they never overlap, and all times are shown in
+**Asia/Shanghai (UTC+8)** wall-clock time regardless of the host's timezone.
 
 ## Process & Connection Throughput
 
@@ -166,7 +181,29 @@ Two more ways to cope with a long list:
 
 - **Aggregate by process** — press `a` to collapse every socket of a process into a
   single row showing the summed RX/TX rate and the connection count. This is the
-  fastest way to see *who* is using bandwidth when a process holds many sockets.
+  fastest way to see *who* is using bandwidth when a process holds many sockets. The
+  aggregate view also shows htop-style process metrics, read from `/proc/<pid>`:
+
+  ```
+  ├ Top Connections 1-3/3 [agg]  ↑↓ pg:scroll c:focus a:agg /:filter ──────────┤
+  │ USER   PROC(PID)        CPU%  MEM%   TIME+        CONNS  RX          TX       │
+  │ dj     node(26951)       3.2   1.4   02:11.48         4  6.1 KB/s    2.0 KB/s │
+  │ root   sshd(882)         0.0   0.2   15:42.07         1  12.0 KB/s   4.0 KB/s │
+  │ systemd-resolve(1031)    0.1   0.5   00:03.90         2  n/a         n/a      │
+  └─────────────────────────────────────────────────────────────────────────────┘
+  ```
+
+  - **USER** — the process owner, resolved from `/proc/<pid>/status` `Uid` via the
+    system password database (`getpwuid_r`). Shows `-` if it cannot be read.
+  - **CPU%** — the process's CPU usage as a percentage of one core, measured over
+    the sampling interval from `/proc/<pid>/stat` (`utime` + `stime` delta).
+  - **MEM%** — the process's resident memory (`VmRSS`) as a percentage of total RAM
+    (`/proc/meminfo` `MemTotal`).
+  - **TIME+** — cumulative CPU time (htop format: `MM:SS.cc` under an hour,
+    `HH:MM:SS` above), from `/proc/<pid>/stat`.
+
+  These columns only appear in the aggregate (by-process) view; the per-connection
+  detail view keeps the `PROC(PID) / PRO / SRC / DST / HOST / SVC / RX / TX` layout.
 - **Focus mode** — press `c` to let the Top Connections panel take over the whole
   screen; press `c` again to return to the normal layout.
 - **Filter** — press `/` and type a substring; it matches process name, pid,
@@ -174,7 +211,7 @@ Two more ways to cope with a long list:
 
 Use `↑` / `↓` (or `j` / `k`) to scroll when the list is longer than the panel.
 
-The data comes from `ss -tunpi`, sampled once per second. For TCP sockets the
+The data comes from `ss -tunpi`, sampled twice per second (2 Hz). For TCP sockets the
 kernel exposes cumulative `bytes_received` / `bytes_sent` counters, so the rate is
 the per-second delta between two samples. UDP is connectionless and the kernel
 does **not** track cumulative per-socket bytes, so UDP rows are shown for context
@@ -199,8 +236,8 @@ Cargo.toml       package manifest (ratatui 0.29, crossterm 0.28)
 - One interface at a time; it does not aggregate all interfaces. The interface
   list is read once at start, so a hot-plugged interface does not appear until
   you restart the program.
-- Counters are read once per second, so short bursts inside a tick are averaged
-  into that interval.
+- Counters are read twice per second (2 Hz), so short bursts inside a 0.5 s tick
+  are averaged into that interval.
 - Sparkline scaling is per-window, so the vertical scale changes when traffic
   changes. Compare shapes, not absolute heights.
 - No logging, no export, no configuration file.

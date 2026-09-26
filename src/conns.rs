@@ -8,12 +8,15 @@
 //! always `None` (rendered as `n/a`).
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::CStr;
 use std::io;
 use std::net::IpAddr;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
+
+use libc;
 
 /// One sampled connection (or UDP socket).
 #[derive(Clone)]
@@ -43,6 +46,23 @@ pub struct AggRow {
     pub count: usize,
     pub rx_rate: f64,
     pub tx_rate: f64,
+    /// Owner username of the process (from `/proc/<pid>/status` Uid → passwd).
+    pub user: String,
+    /// CPU usage as a percentage of one core over the last sampling interval.
+    pub cpu_pct: f64,
+    /// Resident memory as a percentage of total system RAM.
+    pub mem_pct: f64,
+    /// Cumulative CPU time (utime + stime) in seconds, htop's `TIME+`.
+    pub time_secs: f64,
+}
+
+/// htop-style per-process resource info, read from `/proc/<pid>`.
+#[derive(Clone)]
+pub struct ProcInfo {
+    pub user: String,
+    pub cpu_pct: f64,
+    pub mem_pct: f64,
+    pub time_secs: f64,
 }
 
 type Key = (String, String, String);
@@ -68,6 +88,13 @@ pub struct ConnMonitor {
     services: HashMap<(u16, String), String>,
     /// Last known visible row count, used to compute page-scroll steps.
     last_max_rows: usize,
+    /// Per-pid resource info (USER/CPU%/MEM%/TIME+) for processes with at least
+    /// one visible connection. Rebuilt each `sample()`.
+    procs: HashMap<u32, ProcInfo>,
+    /// Previous (cpu ticks, instant) per pid, for computing CPU% deltas.
+    proc_prev: HashMap<u32, (u64, Instant)>,
+    /// Total system RAM in KiB, from `/proc/meminfo` (read once).
+    mem_total_kb: u64,
 }
 
 impl ConnMonitor {
@@ -84,12 +111,17 @@ impl ConnMonitor {
             pending: HashSet::new(),
             services: load_services(),
             last_max_rows: 10,
+            procs: HashMap::new(),
+            proc_prev: HashMap::new(),
+            mem_total_kb: total_mem_kb(),
         }
     }
 
     /// Clear history, peak baseline and scroll position.
     pub fn reset(&mut self) {
         self.prev.clear();
+        self.procs.clear();
+        self.proc_prev.clear();
         self.scroll = 0;
         self.last.clear();
     }
@@ -133,6 +165,48 @@ impl ConnMonitor {
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
+    }
+
+    /// Recompute `self.procs` for every pid present in `conns`, and update
+    /// `self.proc_prev` so the next call can derive a CPU% delta. Reads
+    /// `/proc/<pid>/stat` and `/proc/<pid>/status`; any unreadable process is
+    /// recorded with `"-"` / zeroed values rather than dropping the row.
+    fn refresh_procs(&mut self, conns: &[ConnStat], now: Instant) {
+        let clk = clk_tck();
+        let mut pids: Vec<u32> = conns.iter().filter_map(|c| c.pid).collect();
+        pids.sort_unstable();
+        pids.dedup();
+
+        let mut new_procs: HashMap<u32, ProcInfo> = HashMap::with_capacity(pids.len());
+        for pid in pids {
+            let mut info = ProcInfo {
+                user: "-".to_string(),
+                cpu_pct: 0.0,
+                mem_pct: 0.0,
+                time_secs: 0.0,
+            };
+            if let Some((utime, stime)) = read_proc_stat(pid) {
+                let total_ticks = utime + stime;
+                info.time_secs = total_ticks as f64 / clk as f64;
+                if let Some(&(prev_ticks, prev_inst)) = self.proc_prev.get(&pid) {
+                    let dt = now.duration_since(prev_inst).as_secs_f64();
+                    if dt > 0.0 {
+                        let dcpu = total_ticks.saturating_sub(prev_ticks) as f64;
+                        info.cpu_pct = (dcpu / (clk as f64 * dt)) * 100.0;
+                    }
+                }
+                self.proc_prev.insert(pid, (total_ticks, now));
+            }
+            if let Some((uid, vmrss)) = read_proc_status(pid) {
+                if self.mem_total_kb > 0 {
+                    info.mem_pct = vmrss as f64 / self.mem_total_kb as f64 * 100.0;
+                }
+                info.user = uid_to_user(uid);
+            }
+            new_procs.insert(pid, info);
+        }
+        self.proc_prev.retain(|pid, _| new_procs.contains_key(pid));
+        self.procs = new_procs;
     }
 
     /// Run `ss`, parse it, compute per-connection rates and store the sorted
@@ -275,6 +349,10 @@ impl ConnMonitor {
         // Drop prev entries for connections that disappeared.
         self.prev.retain(|k, _| seen.contains(k));
 
+        // Refresh per-process resource info (USER / CPU% / MEM% / TIME+) for
+        // every pid that currently has a visible connection.
+        self.refresh_procs(&conns, now);
+
         // Sort by throughput (rx+tx) descending; connections with no rate
         // (UDP / first sample) sink to the bottom.
         conns.sort_by(|a, b| {
@@ -332,6 +410,80 @@ fn find_bytes(s: &str, key: &str) -> Option<u64> {
     let after = &s[pos + key.len()..];
     let val: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
     val.parse::<u64>().ok()
+}
+
+/// Clock ticks per second (`sysconf(_SC_CLK_TCK)`), at least 1.
+fn clk_tck() -> u64 {
+    unsafe { libc::sysconf(libc::_SC_CLK_TCK) as u64 }.max(1)
+}
+
+/// Total system RAM in KiB, from `/proc/meminfo` `MemTotal` (0 on failure).
+fn total_mem_kb() -> u64 {
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for line in s.lines() {
+            if line.starts_with("MemTotal:") {
+                if let Some(v) = line.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()) {
+                    return v;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Read `(utime, stime)` in clock ticks from `/proc/<pid>/stat`. The `comm`
+/// field may contain spaces and parentheses, so we split after the *last* `)`.
+fn read_proc_stat(pid: u32) -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let rp = s.rfind(')')?;
+    let rest = &s[rp + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if fields.len() < 13 {
+        return None;
+    }
+    let utime = fields[11].parse::<u64>().ok()?; // 12th field after ')'
+    let stime = fields[12].parse::<u64>().ok()?; // 13th field after ')'
+    Some((utime, stime))
+}
+
+/// Read `(real_uid, VmRSS_kb)` from `/proc/<pid>/status`.
+fn read_proc_status(pid: u32) -> Option<(u32, u64)> {
+    let s = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    let mut uid: Option<u32> = None;
+    let mut vmrss: Option<u64> = None;
+    for line in s.lines() {
+        if uid.is_none() && line.starts_with("Uid:") {
+            uid = line.split_whitespace().nth(1).and_then(|v| v.parse::<u32>().ok());
+        } else if line.starts_with("VmRSS:") {
+            vmrss = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+        }
+        if uid.is_some() && vmrss.is_some() {
+            break;
+        }
+    }
+    Some((uid?, vmrss?))
+}
+
+/// Map a numeric uid to a username via `getpwuid_r`, falling back to the raw
+/// uid string when the account is not in the password database.
+fn uid_to_user(uid: u32) -> String {
+    unsafe {
+        let mut buf = vec![0u8; 1024];
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        );
+        if rc == 0 && !result.is_null() && !pwd.pw_name.is_null() {
+            let name = CStr::from_ptr(pwd.pw_name);
+            return name.to_string_lossy().into_owned();
+        }
+    }
+    uid.to_string()
 }
 
 /// Split an endpoint string (`IP:port`, `[IPv6]:port`, or `*`) into its IP and
@@ -443,12 +595,19 @@ impl ConnMonitor {
         for c in self.last.iter().filter(|c| conn_matches(c, filter)) {
             let entry = map
                 .entry((c.comm.clone(), c.pid))
-                .or_insert_with(|| AggRow {
-                    comm: c.comm.clone(),
-                    pid: c.pid,
-                    count: 0,
-                    rx_rate: 0.0,
-                    tx_rate: 0.0,
+                .or_insert_with(|| {
+                    let p = c.pid.and_then(|p| self.procs.get(&p));
+                    AggRow {
+                        comm: c.comm.clone(),
+                        pid: c.pid,
+                        count: 0,
+                        rx_rate: 0.0,
+                        tx_rate: 0.0,
+                        user: p.map(|p| p.user.clone()).unwrap_or_else(|| "-".to_string()),
+                        cpu_pct: p.map(|p| p.cpu_pct).unwrap_or(0.0),
+                        mem_pct: p.map(|p| p.mem_pct).unwrap_or(0.0),
+                        time_secs: p.map(|p| p.time_secs).unwrap_or(0.0),
+                    }
                 });
             entry.count += 1;
             entry.rx_rate += c.rx_rate.unwrap_or(0.0);
