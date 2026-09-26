@@ -1138,7 +1138,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
                     && label != last_label_text
                 {
                     for (i, ch) in label.chars().enumerate() {
-                        let c = &mut buf[(lx as u16 + i as u16, vrows[8].y)];
+                        let c = &mut buf[(lx as u16 + i as u16, vrows[12].y)];
                         c.set_symbol(&ch.to_string());
                         c.set_style(label_style);
                     }
@@ -1157,7 +1157,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
             && nlx + nlen <= stats_inner.x + stats_inner.width
         {
             for (i, ch) in now_label.chars().enumerate() {
-                let cell = &mut buf[(nlx + i as u16, vrows[8].y)];
+                let cell = &mut buf[(nlx + i as u16, vrows[12].y)];
                 cell.set_symbol(&ch.to_string());
                 cell.set_style(label_style);
             }
