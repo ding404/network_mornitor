@@ -48,12 +48,12 @@ pub struct AggRow {
     pub tx_rate: f64,
     /// Owner username of the process (from `/proc/<pid>/status` Uid → passwd).
     pub user: String,
-    /// CPU usage as a percentage of one core over the last sampling interval.
-    pub cpu_pct: f64,
-    /// Resident memory as a percentage of total system RAM.
-    pub mem_pct: f64,
     /// Cumulative CPU time (utime + stime) in seconds, htop's `TIME+`.
     pub time_secs: f64,
+    /// Recent average CPU usage as a percentage of one core (htop's `CPU%`).
+    pub cpu_pct: f64,
+    /// Resident memory usage as a percentage of total RAM (htop's `MEM%`).
+    pub mem_pct: f64,
 }
 
 /// htop-style per-process resource info, read from `/proc/<pid>`.
@@ -604,9 +604,9 @@ impl ConnMonitor {
                         rx_rate: 0.0,
                         tx_rate: 0.0,
                         user: p.map(|p| p.user.clone()).unwrap_or_else(|| "-".to_string()),
+                        time_secs: p.map(|p| p.time_secs).unwrap_or(0.0),
                         cpu_pct: p.map(|p| p.cpu_pct).unwrap_or(0.0),
                         mem_pct: p.map(|p| p.mem_pct).unwrap_or(0.0),
-                        time_secs: p.map(|p| p.time_secs).unwrap_or(0.0),
                     }
                 });
             entry.count += 1;

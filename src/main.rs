@@ -58,6 +58,16 @@ struct App {
     rx_history: VecDeque<u64>,
     /// Upload speed history (bytes/s), newest at the back.
     tx_history: VecDeque<u64>,
+    /// System-wide CPU utilisation history (0..100 %), newest at the back.
+    sys_cpu_history: VecDeque<f64>,
+    /// System-wide memory usage history (0..100 % of total RAM), newest at the back.
+    sys_mem_history: VecDeque<f64>,
+    /// Previous aggregate busy-ticks from /proc/stat (for the CPU% delta).
+    prev_cpu_busy: u64,
+    /// Previous aggregate total-ticks from /proc/stat (for the CPU% delta).
+    prev_cpu_total: u64,
+    /// Time of the previous /proc/stat sample.
+    prev_cpu_time: Instant,
     /// Current download speed (bytes/s).
     current_rx: u64,
     /// Current upload speed (bytes/s).
@@ -104,6 +114,11 @@ impl App {
             iface_idx,
             rx_history: VecDeque::with_capacity(MAX_HISTORY),
             tx_history: VecDeque::with_capacity(MAX_HISTORY),
+            sys_cpu_history: VecDeque::with_capacity(MAX_HISTORY),
+            sys_mem_history: VecDeque::with_capacity(MAX_HISTORY),
+            prev_cpu_busy: 0,
+            prev_cpu_total: 0,
+            prev_cpu_time: Instant::now(),
             current_rx: 0,
             current_tx: 0,
             peak_speed: 1, // avoid divide-by-zero
@@ -266,6 +281,41 @@ impl App {
         }
         self.last_sample = now;
 
+        // Sample system-wide CPU and memory usage so their histories can be drawn
+        // as waveforms below the DL/UL sparklines. Both are sampled every tick
+        // (~2 Hz) to stay in sync with the traffic history.
+        if let Some((busy, total)) = read_system_cpu() {
+            if self.prev_cpu_total > 0 && total > self.prev_cpu_total {
+                let dt = now.duration_since(self.prev_cpu_time).as_secs_f64();
+                let d_busy = busy.saturating_sub(self.prev_cpu_busy) as f64;
+                let d_total = total.saturating_sub(self.prev_cpu_total) as f64;
+                if dt > 0.0 && d_total > 0.0 {
+                    let pct = (d_busy / d_total * 100.0).clamp(0.0, 100.0);
+                    self.sys_cpu_history.push_back(pct);
+                } else {
+                    self.sys_cpu_history.push_back(0.0);
+                }
+            } else {
+                // First sample on this interface: prime the baseline, no value yet.
+                self.sys_cpu_history.push_back(0.0);
+            }
+            self.prev_cpu_busy = busy;
+            self.prev_cpu_total = total;
+            self.prev_cpu_time = now;
+        }
+        if self.sys_cpu_history.len() > MAX_HISTORY {
+            self.sys_cpu_history.pop_front();
+        }
+
+        if let Some(pct) = read_system_mem_pct() {
+            self.sys_mem_history.push_back(pct.clamp(0.0, 100.0));
+        } else {
+            self.sys_mem_history.push_back(0.0);
+        }
+        if self.sys_mem_history.len() > MAX_HISTORY {
+            self.sys_mem_history.pop_front();
+        }
+
         // Per-connection throughput is sampled at its own slower cadence (~2 Hz)
         // so we don't run `ss` on every main tick.
         if now.duration_since(self.last_conns_sample) >= Duration::from_millis(500) {
@@ -288,6 +338,11 @@ impl App {
         // Drop history and peak from the previous interface.
         self.rx_history.clear();
         self.tx_history.clear();
+        self.sys_cpu_history.clear();
+        self.sys_mem_history.clear();
+        self.prev_cpu_busy = 0;
+        self.prev_cpu_total = 0;
+        self.prev_cpu_time = Instant::now();
         self.current_rx = 0;
         self.current_tx = 0;
         self.peak_speed = 1;
@@ -368,6 +423,53 @@ fn list_interfaces() -> io::Result<Vec<String>> {
     Ok(names)
 }
 
+/// Read the aggregate `cpu` line from `/proc/stat` and return the cumulative
+/// (busy_ticks, total_ticks). `total` is the sum of every field on the line;
+/// `busy` is total minus the idle+iowait portion. Comparing two snapshots'
+/// deltas gives overall CPU utilisation across all cores as a 0..1 fraction
+/// without needing to know the core count.
+fn read_system_cpu() -> Option<(u64, u64)> {
+    let content = fs::read_to_string("/proc/stat").ok()?;
+    let line = content.lines().find(|l| l.starts_with("cpu "))?;
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .skip(1) // drop the "cpu" token
+        .filter_map(|f| f.parse::<u64>().ok())
+        .collect();
+    if fields.len() < 4 {
+        return None;
+    }
+    let total: u64 = fields.iter().sum();
+    // idle (field 3) + iowait (field 4, may be absent on older kernels).
+    let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
+    let busy = total.saturating_sub(idle);
+    Some((busy, total))
+}
+
+/// Read system memory usage as a percentage of total RAM from `/proc/meminfo`.
+/// Uses `MemAvailable` when present (the kernel's best estimate of reclaimable
+/// memory), falling back to `MemFree`. Returns `None` if `MemTotal` is missing.
+fn read_system_mem_pct() -> Option<f64> {
+    let content = fs::read_to_string("/proc/meminfo").ok()?;
+    let mut total: Option<u64> = None;
+    let mut avail: Option<u64> = None;
+    for line in content.lines() {
+        if line.starts_with("MemTotal:") {
+            total = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+        } else if line.starts_with("MemAvailable:") {
+            avail = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+        } else if line.starts_with("MemFree:") && avail.is_none() {
+            avail = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+        }
+    }
+    match (total, avail) {
+        (Some(t), Some(a)) if t > 0 => {
+            Some(((t.saturating_sub(a)) as f64 / t as f64) * 100.0)
+        }
+        _ => None,
+    }
+}
+
 /// Format bytes/s into a human-readable string.
 fn format_speed(bytes_per_sec: u64) -> String {
     const UNITS: &[&str] = &["B/s", "KB/s", "MB/s", "GB/s", "TB/s"];
@@ -382,11 +484,6 @@ fn format_speed(bytes_per_sec: u64) -> String {
     } else {
         format!("{:>6.1} {}", value, UNITS[unit_idx])
     }
-}
-
-/// Format a fraction as a right-aligned percentage (e.g. `" 12.3"`).
-fn fmt_pct(v: f64) -> String {
-    format!("{:>5.1}", v)
 }
 
 /// Format cumulative CPU time the way htop's `TIME+` does: `MM:SS.cc` below an
@@ -548,6 +645,136 @@ fn draw_waveform(
     }
 }
 
+/// Float-valued variant of `draw_waveform` for percentage histories (0..100 %).
+/// The data is already normalised against a known max (e.g. 100.0), so the only
+/// difference from `draw_waveform` is that the series is `f64` rather than `u64`.
+fn draw_waveform_f(
+    f: &mut Frame,
+    area: Rect,
+    history: &VecDeque<f64>,
+    max: f64,
+    color: Color,
+) {
+    if area.width == 0 || area.height == 0 || history.is_empty() || max <= 0.0 {
+        return;
+    }
+    let width = area.width as usize;
+    let height = area.height as usize; // braille character rows
+    let xres = width * 2; // 2 horizontal dots per cell
+    let yres = height * 4; // 4 vertical dots per cell
+
+    let n = history.len();
+
+    // Normalised series (0..1) over the whole buffer.
+    let data: Vec<f64> = history
+        .iter()
+        .map(|&v| (v as f64 / max as f64).clamp(0.0, 1.0))
+        .collect();
+
+    // 3-point moving average for a rounder curve.
+    let smoothed: Vec<f64> = (0..n)
+        .map(|i| {
+            let a = data[if i > 0 { i - 1 } else { i }];
+            let b = data[i];
+            let c = data[if i + 1 < n { i + 1 } else { i }];
+            (a + b + c) / 3.0
+        })
+        .collect();
+
+    // Dynamic X scale (same scheme as draw_waveform): stretch the available
+    // samples across the full width, then "zoom out" once a full day is buffered.
+    let shown = (n as f64).min(MAX_HISTORY as f64);
+    let span = (shown - 1.0).max(1.0);
+    let x_of = |i: usize| -> f64 {
+        i as f64 * (xres - 1) as f64 / span
+    };
+    let y_of = |val: f64| -> i32 {
+        ((1.0 - val) * (yres - 1) as f64).round() as i32
+    };
+
+    let xr = (xres as f64 - 1.0).max(1.0);
+    let mut col_val: Vec<Option<f64>> = vec![None; xres];
+    for dx in 0..xres {
+        let sample_f = dx as f64 * span / xr;
+        let i0 = sample_f.floor() as i32;
+        let i1 = sample_f.ceil() as i32;
+        let mut best: Option<(f64, f64)> = None; // (distance, value)
+        for &i in &[i0, i1] {
+            if i >= 0 && (i as usize) < n {
+                let d = (x_of(i as usize) - dx as f64).abs();
+                let better = match best {
+                    None => true,
+                    Some((bd, _)) => d < bd,
+                };
+                if better {
+                    best = Some((d, smoothed[i as usize]));
+                }
+            }
+        }
+        if let Some((_, v)) = best {
+            col_val[dx] = Some(v);
+        }
+    }
+
+    let mut dots = vec![false; xres * yres];
+    let points: Vec<(i32, i32)> = col_val
+        .iter()
+        .enumerate()
+        .filter_map(|(dx, v)| v.map(|val| (dx as i32, y_of(val))))
+        .collect();
+
+    if points.len() == 1 {
+        let (x, y) = points[0];
+        if x >= 0 && x < xres as i32 && y >= 0 && y < yres as i32 {
+            dots[y as usize * xres + x as usize] = true;
+        }
+    } else {
+        for k in 0..points.len().saturating_sub(1) {
+            let (x0, y0) = points[k];
+            let (x1, y1) = points[k + 1];
+            let steps = ((x1 - x0).abs()).max(1) as i32;
+            for s in 0..=steps {
+                let t = s as f64 / steps as f64;
+                let x = (x0 as f64 + (x1 - x0) as f64 * t).round() as i32;
+                let y = (y0 as f64 + (y1 - y0) as f64 * t).round() as i32;
+                if x >= 0 && x < xres as i32 && y >= 0 && y < yres as i32 {
+                    dots[y as usize * xres + x as usize] = true;
+                }
+            }
+        }
+    }
+
+    let buf = f.buffer_mut();
+    for cy in 0..height {
+        for cx in 0..width {
+            let mut bits: u32 = 0;
+            for dy in 0..4 {
+                for dx in 0..2 {
+                    if dots[(cy * 4 + dy) * xres + (cx * 2 + dx)] {
+                        let bit = match (dx, dy) {
+                            (0, 0) => 0,
+                            (0, 1) => 1,
+                            (0, 2) => 2,
+                            (1, 0) => 3,
+                            (1, 1) => 4,
+                            (1, 2) => 5,
+                            (0, 3) => 6,
+                            (1, 3) => 7,
+                            _ => 0,
+                        };
+                        bits |= 1 << bit;
+                    }
+                }
+            }
+            let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
+            let cell = &mut buf[(area.x + cx as u16, area.y + cy as u16)];
+            let s = ch.to_string();
+            cell.set_symbol(&s);
+            cell.set_style(Style::default().fg(color));
+        }
+    }
+}
+
 /// Render UI.
 fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -563,7 +790,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(15), // top: title + compact stats + footer
+                Constraint::Length(23), // top: title + stats box (DL/UL/CPU/MEM) + footer
                 Constraint::Min(5),     // bottom: top connections
             ])
             .split(area);
@@ -578,7 +805,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // title
-            Constraint::Length(11), // compact stats box (DL/UL + time axis)
+            Constraint::Length(19), // stats box: DL/UL/CPU/MEM waveforms + time axis
             Constraint::Length(1), // footer
         ])
         .split(area);
@@ -618,16 +845,21 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     let stats_block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            format!(" ▼ Download / ▲ Upload History ({:.0}h) ", window_h),
+            format!(" ▼ DL / ▲ UL / CPU / MEM History ({:.0}h) ", window_h),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
     let stats_inner = stats_block.inner(main_layout[1]);
     f.render_widget(stats_block, main_layout[1]);
 
-    // Rows: [Download (3)] [divider (1)] [Upload (3)] [time-axis ticks (1)] [time labels (1)].
+    // Rows: [Download (3)] [div (1)] [Upload (3)] [div (1)] [CPU (3)] [div (1)]
+    //       [MEM (3)] [time-axis baseline (1)] [time labels (1)].
     let vrows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(3),
@@ -660,37 +892,58 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(ul_label, ul[0]);
     draw_waveform(f, ul[2], &app.tx_history, tx_max, Color::Red);
 
+    // System CPU: [label | vdiv | waveform]. Values are 0..100 %, so the fixed
+    // max is simply 100.0 (the waveform fills proportionally to total capacity).
+    let cpu = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .split(vrows[4]);
+    let cpu_now = app.sys_cpu_history.back().copied().unwrap_or(0.0);
+    let cpu_label = Paragraph::new(Line::from(Span::styled(
+        format!("▌ CPU {:.1}%", cpu_now),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(cpu_label, cpu[0]);
+    draw_waveform_f(f, cpu[2], &app.sys_cpu_history, 100.0, Color::Yellow);
+
+    // System MEM: [label | vdiv | waveform].
+    let mem = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .split(vrows[6]);
+    let mem_now = app.sys_mem_history.back().copied().unwrap_or(0.0);
+    let mem_label = Paragraph::new(Line::from(Span::styled(
+        format!("▌ MEM {:.1}%", mem_now),
+        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(mem_label, mem[0]);
+    draw_waveform_f(f, mem[2], &app.sys_mem_history, 100.0, Color::Magenta);
+
     // Draw the grid dividers directly into the buffer so the vertical and
-    // horizontal lines join into a clean cross.
+    // horizontal lines join into clean crosses. There is a horizontal divider
+    // between each waveform row, plus the baseline under the MEM waveform that
+    // carries the time axis.
     let buf = f.buffer_mut();
     let vline_x = dl[1].x;
-    let hline_y = vrows[1].y;
     let grid_style = Style::default().fg(Color::DarkGray);
+    // Vertical divider spanning the whole stats box.
     for y in stats_inner.y..stats_inner.y + stats_inner.height {
         let cell = &mut buf[(vline_x, y)];
         cell.set_symbol("│");
         cell.set_style(grid_style);
     }
-    for x in stats_inner.x..stats_inner.x + stats_inner.width {
-        let cell = &mut buf[(x, hline_y)];
-        cell.set_symbol("─");
-        cell.set_style(grid_style);
+    // Horizontal dividers + axis baseline (one cross each where they meet the vline).
+    let hlines = [vrows[1].y, vrows[3].y, vrows[5].y, vrows[7].y];
+    for &hy in &hlines {
+        for x in stats_inner.x..stats_inner.x + stats_inner.width {
+            let cell = &mut buf[(x, hy)];
+            cell.set_symbol("─");
+            cell.set_style(grid_style);
+        }
+        let cross = &mut buf[(vline_x, hy)];
+        cross.set_symbol("┼");
+        cross.set_style(grid_style);
     }
-    let cross = &mut buf[(vline_x, hline_y)];
-    cross.set_symbol("┼");
-    cross.set_style(grid_style);
-
-    // Baseline for the bottom time axis (horizontal line under the UL waveform),
-    // with the time labels drawn below it.
-    let axis_y = vrows[3].y;
-    for x in stats_inner.x..stats_inner.x + stats_inner.width {
-        let cell = &mut buf[(x, axis_y)];
-        cell.set_symbol("─");
-        cell.set_style(grid_style);
-    }
-    let axis_cross = &mut buf[(vline_x, axis_y)];
-    axis_cross.set_symbol("┼");
-    axis_cross.set_style(grid_style);
 
     // ── Time scale on the X axis ─────────────────────────────────────────────
     // A `now HH:MM:SS` label is printed at the right edge (newest sample =
@@ -738,7 +991,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
                     && label != last_label_text
                 {
                     for (i, ch) in label.chars().enumerate() {
-                        let c = &mut buf[(lx as u16 + i as u16, vrows[4].y)];
+                        let c = &mut buf[(lx as u16 + i as u16, vrows[8].y)];
                         c.set_symbol(&ch.to_string());
                         c.set_style(label_style);
                     }
@@ -757,7 +1010,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
             && nlx + nlen <= stats_inner.x + stats_inner.width
         {
             for (i, ch) in now_label.chars().enumerate() {
-                let cell = &mut buf[(nlx + i as u16, vrows[4].y)];
+                let cell = &mut buf[(nlx + i as u16, vrows[8].y)];
                 cell.set_symbol(&ch.to_string());
                 cell.set_style(label_style);
             }
@@ -873,8 +1126,8 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
                     Row::new(vec![
                         Cell::from(a.user.clone()),
                         Cell::from(proc),
-                        Cell::from(fmt_pct(a.cpu_pct)),
-                        Cell::from(fmt_pct(a.mem_pct)),
+                        Cell::from(format!("{:>6.1}%", a.cpu_pct)),
+                        Cell::from(format!("{:>6.1}%", a.mem_pct)),
                         Cell::from(fmt_time_plus(a.time_secs)),
                         Cell::from(a.count.to_string()),
                         Cell::from(format_speed(a.rx_rate as u64)),
@@ -916,8 +1169,8 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
         vec![
             Constraint::Length(8),  // USER
             Constraint::Min(16),    // PROC(PID)
-            Constraint::Length(6),  // CPU%
-            Constraint::Length(6),  // MEM%
+            Constraint::Length(16), // CPU% (sparkline + value)
+            Constraint::Length(16), // MEM% (sparkline + value)
             Constraint::Length(10), // TIME+
             Constraint::Length(6),  // CONNS
             Constraint::Length(11), // RX
@@ -1039,6 +1292,11 @@ fn run_app<B: Backend>(
                         // Reset history, peak, connection monitor and filter.
                         app.rx_history.clear();
                         app.tx_history.clear();
+                        app.sys_cpu_history.clear();
+                        app.sys_mem_history.clear();
+                        app.prev_cpu_busy = 0;
+                        app.prev_cpu_total = 0;
+                        app.prev_cpu_time = Instant::now();
                         app.peak_speed = 1;
                         app.conns.reset();
                         app.filter.clear();

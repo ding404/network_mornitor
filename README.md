@@ -4,12 +4,15 @@ A tiny terminal network monitor written in Rust. It shows live download and uplo
 speed for one network interface, with gauges and sparkline history charts.
 
 ```
-┌ ◉ Network Monitor  │  interface: wlp2s0  │  iface 1/4  │  n/p: iface  │  r: reset  │  q: quit ┐
-┌ ▼ Download / ▲ Upload History (24h) ─────────────────────────────────────────────┐
-┌ ▼ Download / ▲ Upload History (24h) ─────────────────────────────────────────────┐
+┌ ◉ Network Monitor  │  interface: wlp2s0  │  iface 1/4  │  n/p: iface  │  i: auto-iface  │  r: reset  │  q: quit ┐
+┌ ▼ DL / ▲ UL / CPU / MEM History (24h) ───────────────────────────────────────────┐
 │ ▼ DL 1.2 MB/s  │⠀⠀⣀⡤⠖⠒⠒⠦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⠴⠒⠒⠲⢤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠴⠒⠒⠦⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡤⠖⠒⠒⠦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⠴⠒⠒⠲⢤⣀⠀⠀⠀⠀⠀⠀⠀│
 │ ▲ UL 128 KB/s  │⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡏⢹⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣰⠋⣇⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡼⢹⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡏⢧⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀│
 │ ▲ UL 128 KB/s  │⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦│
+│ ▌ CPU 23.4%   │⠀⠀⠀⠀⠀⢀⡴⠒⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉│
+│ ▌ MEM 41.8%   │⠀⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤│
+│             ├─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
+│ 06:00          12:00          18:00          now 14:21:03                          │
 │ Session peak: 5.4 MB/s  │  Samples: 600                                          │
 ├ Top Connections (by throughput) ────────────────────────────────────────────────────┤
 │ PROC(PID)      PRO  SRC             DST             HOST       SVC    RX      TX   │
@@ -136,17 +139,20 @@ to toggle it back on.
 | Area | Meaning |
 | --- | --- |
 | Title bar | Program name, the interface in use, and its position in the list |
-| DOWNLOAD / UPLOAD box | Current DL/UL speed (bytes/s, binary units) on the left, with a hollow braille history waveform on the right spanning the last 24 hours (172800 samples @ 2 Hz) |
+| DL / UL / CPU / MEM box | The current value of each metric on the left, with a hollow braille history waveform on the right spanning the last 24 hours (172800 samples @ 2 Hz) |
 | Download waveform | Hollow braille line of download speed over the dynamic 24-hour window |
 | Upload waveform | Hollow braille line of upload speed over the dynamic 24-hour window |
+| CPU waveform | Hollow braille line of **system-wide** CPU utilisation (%) over the dynamic 24-hour window; the value shown is the latest reading (left-aligned under the `CPU` title) |
+| MEM waveform | Hollow braille line of **system-wide** memory usage (%) — `(MemTotal − MemAvailable) / MemTotal` — over the dynamic 24-hour window |
 | Footer | Session peak speed, number of stored samples, and auto-iface status (`auto: on/off`) |
 
-The waveform scale is the maximum value inside the current window plus 10 percent
-headroom, so it rescales as traffic changes. The X-axis sits at the bottom of the
-chart: below the baseline a `now HH:MM:SS` label (right edge) and adaptive `HH:MM`
-time labels are drawn on the row beneath it. The number of `HH:MM` labels scales
-with the terminal width so they never overlap, and all times are shown in
-**Asia/Shanghai (UTC+8)** wall-clock time regardless of the host's timezone.
+The DL/UL waveform scale is the maximum value inside the current window plus 10
+percent headroom, so it rescales as traffic changes. The CPU and MEM waveforms use
+a fixed 0–100 % scale. The X-axis sits at the bottom of the chart: below the
+baseline a `now HH:MM:SS` label (right edge) and adaptive `HH:MM` time labels are
+drawn on the row beneath it. The number of `HH:MM` labels scales with the terminal
+width so they never overlap, and all times are shown in **Asia/Shanghai (UTC+8)**
+wall-clock time regardless of the host's timezone.
 
 ## Process & Connection Throughput
 
@@ -186,11 +192,11 @@ Two more ways to cope with a long list:
 
   ```
   ├ Top Connections 1-3/3 [agg]  ↑↓ pg:scroll c:focus a:agg /:filter ──────────┤
-  │ USER   PROC(PID)        CPU%  MEM%   TIME+        CONNS  RX          TX       │
-  │ dj     node(26951)       3.2   1.4   02:11.48         4  6.1 KB/s    2.0 KB/s │
-  │ root   sshd(882)         0.0   0.2   15:42.07         1  12.0 KB/s   4.0 KB/s │
-  │ systemd-resolve(1031)    0.1   0.5   00:03.90         2  n/a         n/a      │
-  └─────────────────────────────────────────────────────────────────────────────┘
+  │ USER   PROC(PID)         CPU%    MEM%    TIME+        CONNS  RX          TX       │
+  │ dj     node(26951)       75.0    40.0    02:11.48         4  6.1 KB/s    2.0 KB/s │
+  │ root   sshd(882)          0.0     0.2    15:42.07         1  12.0 KB/s   4.0 KB/s │
+  │ systemd-resolve(1031)     0.1     0.5    00:03.90         2  n/a         n/a      │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
   ```
 
   - **USER** — the process owner, resolved from `/proc/<pid>/status` `Uid` via the
@@ -201,6 +207,9 @@ Two more ways to cope with a long list:
     (`/proc/meminfo` `MemTotal`).
   - **TIME+** — cumulative CPU time (htop format: `MM:SS.cc` under an hour,
     `HH:MM:SS` above), from `/proc/<pid>/stat`.
+
+  The **system-wide** CPU and memory history are drawn as waveforms in the top box
+  (below the DL/UL waveforms), not inline here.
 
   These columns only appear in the aggregate (by-process) view; the per-connection
   detail view keeps the `PROC(PID) / PRO / SRC / DST / HOST / SVC / RX / TX` layout.
