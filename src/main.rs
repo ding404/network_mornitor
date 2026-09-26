@@ -1388,7 +1388,7 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
     let widths: Vec<Constraint> = if app.aggregate {
         vec![
             Constraint::Length(8),  // USER
-            Constraint::Min(16),    // PROC(PID)
+            Constraint::Length(24), // PROC(PID)
             Constraint::Length(16), // CPU%
             Constraint::Length(16), // MEM%
             Constraint::Length(10), // TIME+
