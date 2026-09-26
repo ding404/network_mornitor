@@ -106,6 +106,11 @@ pub struct ConnMonitor {
     proc_io_prev: HashMap<u32, (u64, u64, Instant)>,
     /// Total system RAM in KiB, from `/proc/meminfo` (read once).
     mem_total_kb: u64,
+    /// Cache of uid → username. Populated lazily: an in-process `getpwuid_r`
+    /// lookup first, falling back to `getent passwd <uid>` (which honours NSS
+    /// modules such as ldap/sssd that a static musl build cannot use directly).
+    /// Misses are cached too, so we never re-spawn `getent` for the same uid.
+    uid_cache: HashMap<u32, String>,
 }
 
 impl ConnMonitor {
@@ -126,6 +131,7 @@ impl ConnMonitor {
             proc_prev: HashMap::new(),
             proc_io_prev: HashMap::new(),
             mem_total_kb: total_mem_kb(),
+            uid_cache: HashMap::new(),
         }
     }
 
@@ -216,7 +222,7 @@ impl ConnMonitor {
                 if self.mem_total_kb > 0 {
                     info.mem_pct = vmrss as f64 / self.mem_total_kb as f64 * 100.0;
                 }
-                info.user = uid_to_user(uid);
+                info.user = self.resolve_user(uid);
             }
             // Per-process disk I/O from `/proc/<pid>/io` (cumulative counters).
             // Unreadable for processes owned by other users; treated as 0.0.
@@ -402,6 +408,29 @@ impl ConnMonitor {
         self.last = conns;
         Ok(())
     }
+
+    /// Resolve a uid to a username, caching the outcome in `self.uid_cache`.
+    ///
+    /// Tries the in-process `getpwuid_r` first (fast, covers `/etc/passwd`); when
+    /// that yields only the raw numeric uid, falls back to `getent passwd <uid>`
+    /// (NSS-aware, so it resolves ldap/sssd/systemd accounts that a static musl
+    /// build cannot). Both outcomes are cached, so `getent` is spawned at most once
+    /// per distinct uid for the life of the process.
+    fn resolve_user(&mut self, uid: u32) -> String {
+        if let Some(name) = self.uid_cache.get(&uid) {
+            return name.clone();
+        }
+        let mut name = uid_to_user(uid);
+        // `uid_to_user` echoes the numeric uid when no name is found; only then do we
+        // spend a `getent` call to consult NSS.
+        if name.parse::<u32>().is_ok() {
+            if let Some(resolved) = getent_user(uid) {
+                name = resolved;
+            }
+        }
+        self.uid_cache.insert(uid, name.clone());
+        name
+    }
 }
 
 /// Parse `users:(("name",pid=N,fd=M), ...)` and return the first owner's
@@ -534,6 +563,35 @@ fn uid_to_user(uid: u32) -> String {
         }
     }
     uid.to_string()
+}
+
+/// Resolve a uid to a username, consulting an in-process `getpwuid_r` first and
+/// falling back to `getent passwd <uid>` when that returns only the raw number.
+///
+/// The fallback matters for static musl binaries: musl's `getpwuid_r` reads
+/// `/etc/passwd` directly but cannot use NSS modules (ldap/sssd/systemd), so
+/// accounts provided by those sources would otherwise show as a bare uid. `getent`
+/// is itself dynamically linked against the system libc and honours NSS, so it
+/// resolves names a static build cannot. Results are cached so `getent` is only
+/// spawned once per distinct uid.
+fn getent_user(uid: u32) -> Option<String> {
+    let out = Command::new("getent")
+        .arg("passwd")
+        .arg(uid.to_string())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // `getent passwd <uid>` prints "name:x:uid:gid:gecos:home:shell".
+    let line = String::from_utf8_lossy(&out.stdout);
+    let name = line.split('\n').next()?.split(':').next()?;
+    let name = name.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// Split an endpoint string (`IP:port`, `[IPv6]:port`, or `*`) into its IP and
@@ -774,6 +832,22 @@ mod tests {
             parse_users(r#"users:(("node-MainThread",pid=26951,fd=24))"#);
         assert_eq!(comm, "node-MainThread");
         assert_eq!(pid, Some(26951));
+    }
+
+    #[test]
+    fn getent_user_parses_name() {
+        // uid 1000 resolves to "dj" on this dev box via getent passwd; if that
+        // ever changes the test still validates the parsing shape (name:x:uid:...).
+        if let Some(name) = getent_user(1000) {
+            assert!(!name.is_empty());
+            assert!(!name.contains(':'));
+        }
+    }
+
+    #[test]
+    fn getent_user_unknown_uid_is_none() {
+        // A uid that cannot exist resolves to nothing (no panic, no fake name).
+        assert!(getent_user(u32::MAX).is_none());
     }
 
     #[test]
