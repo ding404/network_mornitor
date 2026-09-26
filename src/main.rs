@@ -987,7 +987,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     // Download: [label | vdiv | sparkline].
     let dl = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
         .split(vrows[0]);
     let dl_label = Paragraph::new(Line::from(Span::styled(
         format!("▼ DL {}", format_speed(app.current_rx)),
@@ -999,7 +999,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     // Upload: [label | vdiv | sparkline].
     let ul = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
         .split(vrows[2]);
     let ul_label = Paragraph::new(Line::from(Span::styled(
         format!("▲ UL {}", format_speed(app.current_tx)),
@@ -1012,7 +1012,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     // max is simply 100.0 (the waveform fills proportionally to total capacity).
     let cpu = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
         .split(vrows[4]);
     let cpu_now = app.sys_cpu_history.back().copied().unwrap_or(0.0);
     let cpu_label = Paragraph::new(Line::from(Span::styled(
@@ -1025,7 +1025,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     // System MEM: [label | vdiv | waveform].
     let mem = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
         .split(vrows[6]);
     let mem_now = app.sys_mem_history.back().copied().unwrap_or(0.0);
     let mem_label = Paragraph::new(Line::from(Span::styled(
@@ -1039,7 +1039,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     let dr_max = sparkline_max_f(&app.sys_disk_read_history);
     let diskr = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
         .split(vrows[8]);
     let diskr_now = app.sys_disk_read_history.back().copied().unwrap_or(0.0);
     let diskr_label = Paragraph::new(Line::from(Span::styled(
@@ -1053,7 +1053,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     let dw_max = sparkline_max_f(&app.sys_disk_write_history);
     let diskw = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
         .split(vrows[10]);
     let diskw_now = app.sys_disk_write_history.back().copied().unwrap_or(0.0);
     let diskw_label = Paragraph::new(Line::from(Span::styled(
