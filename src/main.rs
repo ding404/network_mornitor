@@ -1,7 +1,7 @@
 mod conns;
 use conns::{AggRow, ConnMonitor, ConnStat};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -65,6 +65,16 @@ struct App {
     sys_cpu_history: VecDeque<f64>,
     /// System-wide memory usage history (0..100 % of total RAM), newest at the back.
     sys_mem_history: VecDeque<f64>,
+    /// System-wide disk read throughput history (bytes/s), newest at the back.
+    sys_disk_read_history: VecDeque<f64>,
+    /// System-wide disk write throughput history (bytes/s), newest at the back.
+    sys_disk_write_history: VecDeque<f64>,
+    /// Previous cumulative disk read sectors (from /proc/diskstats) for the delta.
+    prev_disk_read_sectors: u64,
+    /// Previous cumulative disk write sectors for the delta.
+    prev_disk_write_sectors: u64,
+    /// Time of the previous disk-stat sample.
+    prev_disk_time: Instant,
     /// Previous aggregate busy-ticks from /proc/stat (for the CPU% delta).
     prev_cpu_busy: u64,
     /// Previous aggregate total-ticks from /proc/stat (for the CPU% delta).
@@ -127,6 +137,11 @@ impl App {
             tx_history: VecDeque::with_capacity(MAX_HISTORY),
             sys_cpu_history: VecDeque::with_capacity(MAX_HISTORY),
             sys_mem_history: VecDeque::with_capacity(MAX_HISTORY),
+            sys_disk_read_history: VecDeque::with_capacity(MAX_HISTORY),
+            sys_disk_write_history: VecDeque::with_capacity(MAX_HISTORY),
+            prev_disk_read_sectors: 0,
+            prev_disk_write_sectors: 0,
+            prev_disk_time: Instant::now(),
             prev_cpu_busy: 0,
             prev_cpu_total: 0,
             prev_cpu_time: Instant::now(),
@@ -331,6 +346,39 @@ impl App {
             self.sys_mem_history.pop_front();
         }
 
+        // System disk read/write throughput (bytes/s). Sectors are 512 bytes; we sum
+        // the cumulative counters and divide by the elapsed time between ticks.
+        if let Some((rsec, wsec)) = read_sys_disk_sectors() {
+            if self.prev_disk_read_sectors > 0
+                && rsec >= self.prev_disk_read_sectors
+                && wsec >= self.prev_disk_write_sectors
+            {
+                let dt = now.duration_since(self.prev_disk_time).as_secs_f64();
+                if dt > 0.0 {
+                    let dr = (rsec - self.prev_disk_read_sectors) as f64 * 512.0 / dt;
+                    let dw = (wsec - self.prev_disk_write_sectors) as f64 * 512.0 / dt;
+                    self.sys_disk_read_history.push_back(dr);
+                    self.sys_disk_write_history.push_back(dw);
+                } else {
+                    self.sys_disk_read_history.push_back(0.0);
+                    self.sys_disk_write_history.push_back(0.0);
+                }
+            } else {
+                // First sample (or counter reset): prime the baseline, no value yet.
+                self.sys_disk_read_history.push_back(0.0);
+                self.sys_disk_write_history.push_back(0.0);
+            }
+            self.prev_disk_read_sectors = rsec;
+            self.prev_disk_write_sectors = wsec;
+            self.prev_disk_time = now;
+        }
+        if self.sys_disk_read_history.len() > MAX_HISTORY {
+            self.sys_disk_read_history.pop_front();
+        }
+        if self.sys_disk_write_history.len() > MAX_HISTORY {
+            self.sys_disk_write_history.pop_front();
+        }
+
         // Per-connection throughput is sampled at its own slower cadence (~2 Hz)
         // so we don't run `ss` on every main tick.
         if now.duration_since(self.last_conns_sample) >= Duration::from_millis(500) {
@@ -355,6 +403,11 @@ impl App {
         self.tx_history.clear();
         self.sys_cpu_history.clear();
         self.sys_mem_history.clear();
+        self.sys_disk_read_history.clear();
+        self.sys_disk_write_history.clear();
+        self.prev_disk_read_sectors = 0;
+        self.prev_disk_write_sectors = 0;
+        self.prev_disk_time = Instant::now();
         self.prev_cpu_busy = 0;
         self.prev_cpu_total = 0;
         self.prev_cpu_time = Instant::now();
@@ -386,6 +439,12 @@ impl App {
         let max = window.iter().fold(1u64, |acc, &&v| acc.max(v));
         (max as f64 * 1.1) as u64 + 1
     }
+}
+
+/// f64 variant of `App::sparkline_max` for the disk-throughput histories.
+fn sparkline_max_f(history: &VecDeque<f64>) -> f64 {
+    let max = history.iter().cloned().fold(1.0_f64, f64::max);
+    max * 1.1 + 1.0
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -483,6 +542,40 @@ fn read_system_mem_pct() -> Option<f64> {
         }
         _ => None,
     }
+}
+
+/// Read cumulative disk sectors read/written across all whole-block devices.
+///
+/// `/proc/diskstats` counts both whole disks and their partitions, and a
+/// partition's counters are a subset of its parent disk's, so summing everything
+/// double-counts. To avoid that we only sum device names that appear as entries
+/// under `/sys/block` (these are the whole disks / loop / ram devices; partitions
+/// live in subdirectories and are excluded). Each sector is 512 bytes. Returns
+/// `(read_sectors, write_sectors)`.
+fn read_sys_disk_sectors() -> Option<(u64, u64)> {
+    let mut devices: HashSet<String> = HashSet::new();
+    if let Ok(entries) = fs::read_dir("/sys/block") {
+        for entry in entries.flatten() {
+            devices.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    let content = fs::read_to_string("/proc/diskstats").ok()?;
+    let mut read_sectors = 0u64;
+    let mut write_sectors = 0u64;
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 {
+            continue;
+        }
+        // If we resolved a device list, only count whole disks; otherwise sum all.
+        if !devices.is_empty() && !devices.contains(fields[2]) {
+            continue;
+        }
+        // fields[5] = sectors read, fields[9] = sectors written (1-based indices).
+        read_sectors += fields[5].parse::<u64>().unwrap_or(0);
+        write_sectors += fields[9].parse::<u64>().unwrap_or(0);
+    }
+    Some((read_sectors, write_sectors))
 }
 
 /// Format bytes/s into a human-readable string.
@@ -820,7 +913,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // title
-            Constraint::Length(19), // stats box: DL/UL/CPU/MEM waveforms + time axis
+            Constraint::Length(27), // stats box: DL/UL/CPU/MEM/DISK R/DISK W waveforms + time axis
             Constraint::Length(1), // footer
         ])
         .split(area);
@@ -860,17 +953,21 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     let stats_block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            format!(" ▼ DL / ▲ UL / CPU / MEM History ({:.0}h) ", window_h),
+            format!(" ▼ DL / ▲ UL / CPU / MEM / DISK R / DISK W History ({:.0}h) ", window_h),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
     let stats_inner = stats_block.inner(main_layout[1]);
     f.render_widget(stats_block, main_layout[1]);
 
-    // Rows: [Download (3)] [div (1)] [Upload (3)] [div (1)] [CPU (3)] [div (1)]
-    //       [MEM (3)] [time-axis baseline (1)] [time labels (1)].
+    // Rows: [DL (3)] [div] [UL (3)] [div] [CPU (3)] [div] [MEM (3)] [div]
+    //       [DISK R (3)] [div] [DISK W (3)] [time-axis baseline (1)] [time labels (1)].
     let vrows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(3),
@@ -934,9 +1031,37 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(mem_label, mem[0]);
     draw_waveform_f(f, mem[2], &app.sys_mem_history, 100.0, Color::Magenta);
 
+    // System DISK R: [label | vdiv | waveform]. Byte rates, scaled dynamically.
+    let dr_max = sparkline_max_f(&app.sys_disk_read_history);
+    let diskr = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .split(vrows[8]);
+    let diskr_now = app.sys_disk_read_history.back().copied().unwrap_or(0.0);
+    let diskr_label = Paragraph::new(Line::from(Span::styled(
+        format!("▌ DISK R {}", format_speed(diskr_now as u64)),
+        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(diskr_label, diskr[0]);
+    draw_waveform_f(f, diskr[2], &app.sys_disk_read_history, dr_max, Color::Blue);
+
+    // System DISK W: [label | vdiv | waveform].
+    let dw_max = sparkline_max_f(&app.sys_disk_write_history);
+    let diskw = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(16), Constraint::Length(1), Constraint::Min(20)])
+        .split(vrows[10]);
+    let diskw_now = app.sys_disk_write_history.back().copied().unwrap_or(0.0);
+    let diskw_label = Paragraph::new(Line::from(Span::styled(
+        format!("▌ DISK W {}", format_speed(diskw_now as u64)),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(diskw_label, diskw[0]);
+    draw_waveform_f(f, diskw[2], &app.sys_disk_write_history, dw_max, Color::Cyan);
+
     // Draw the grid dividers directly into the buffer so the vertical and
     // horizontal lines join into clean crosses. There is a horizontal divider
-    // between each waveform row, plus the baseline under the MEM waveform that
+    // between each waveform row, plus the baseline under the DISK W waveform that
     // carries the time axis.
     let buf = f.buffer_mut();
     let vline_x = dl[1].x;
@@ -948,7 +1073,14 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
         cell.set_style(grid_style);
     }
     // Horizontal dividers + axis baseline (one cross each where they meet the vline).
-    let hlines = [vrows[1].y, vrows[3].y, vrows[5].y, vrows[7].y];
+    let hlines = [
+        vrows[1].y,
+        vrows[3].y,
+        vrows[5].y,
+        vrows[7].y,
+        vrows[9].y,
+        vrows[11].y,
+    ];
     for &hy in &hlines {
         for x in stats_inner.x..stats_inner.x + stats_inner.width {
             let cell = &mut buf[(x, hy)];
@@ -1073,10 +1205,12 @@ enum SortKey {
     Conns,
     Rx,
     Tx,
+    DiskR,
+    DiskW,
 }
 
 /// Order in which `o` (rotate sort column) steps through columns, per view.
-const AGG_SORT_ORDER: [SortKey; 8] = [
+const AGG_SORT_ORDER: [SortKey; 10] = [
     SortKey::User,
     SortKey::Proc,
     SortKey::Cpu,
@@ -1085,6 +1219,8 @@ const AGG_SORT_ORDER: [SortKey; 8] = [
     SortKey::Conns,
     SortKey::Rx,
     SortKey::Tx,
+    SortKey::DiskR,
+    SortKey::DiskW,
 ];
 const DETAIL_SORT_ORDER: [SortKey; 8] = [
     SortKey::Proc,
@@ -1150,6 +1286,8 @@ fn sort_val(row: &ConnRow, key: SortKey) -> SortVal {
         (ConnRow::Agg(a), SortKey::Conns) => SortVal::Num(a.count as f64),
         (ConnRow::Agg(a), SortKey::Rx) => SortVal::Num(a.rx_rate),
         (ConnRow::Agg(a), SortKey::Tx) => SortVal::Num(a.tx_rate),
+        (ConnRow::Agg(a), SortKey::DiskR) => SortVal::Num(a.disk_read_rate),
+        (ConnRow::Agg(a), SortKey::DiskW) => SortVal::Num(a.disk_write_rate),
         (ConnRow::Agg(a), SortKey::Throughput) => SortVal::Num(a.rx_rate + a.tx_rate),
         (ConnRow::Detail(c), SortKey::Proc) => SortVal::Text(proc_sort_label(&c.comm, c.pid)),
         (ConnRow::Detail(c), SortKey::Proto) => SortVal::Text(c.proto.clone()),
@@ -1253,6 +1391,8 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Length(6),  // CONNS
             Constraint::Length(11), // RX
             Constraint::Length(11), // TX
+            Constraint::Length(11), // DISKR
+            Constraint::Length(11), // DISKW
         ]
     } else {
         vec![
@@ -1270,7 +1410,7 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
     // Header labels + the SortKey each maps to (parallel arrays).
     let (labels, keys): (&[&str], &[Option<SortKey>]) = if app.aggregate {
         (
-            &["USER", "PROC(PID)", "CPU%", "MEM%", "TIME+", "CONNS", "RX", "TX"],
+            &["USER", "PROC(PID)", "CPU%", "MEM%", "TIME+", "CONNS", "RX", "TX", "DISKR", "DISKW"],
             &[
                 Some(SortKey::User),
                 Some(SortKey::Proc),
@@ -1280,6 +1420,8 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
                 Some(SortKey::Conns),
                 Some(SortKey::Rx),
                 Some(SortKey::Tx),
+                Some(SortKey::DiskR),
+                Some(SortKey::DiskW),
             ],
         )
     } else {
@@ -1355,6 +1497,8 @@ fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
                         Cell::from(a.count.to_string()),
                         Cell::from(format_speed(a.rx_rate as u64)),
                         Cell::from(format_speed(a.tx_rate as u64)),
+                        Cell::from(format_speed(a.disk_read_rate as u64)),
+                        Cell::from(format_speed(a.disk_write_rate as u64)),
                     ])
                     .style(style)
                 }
@@ -1498,6 +1642,11 @@ fn run_app<B: Backend>(
                         app.tx_history.clear();
                         app.sys_cpu_history.clear();
                         app.sys_mem_history.clear();
+                        app.sys_disk_read_history.clear();
+                        app.sys_disk_write_history.clear();
+                        app.prev_disk_read_sectors = 0;
+                        app.prev_disk_write_sectors = 0;
+                        app.prev_disk_time = Instant::now();
                         app.prev_cpu_busy = 0;
                         app.prev_cpu_total = 0;
                         app.prev_cpu_time = Instant::now();
@@ -1684,6 +1833,19 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_header_shows_disk_columns() {
+        let mut app = sample_app();
+        app.aggregate = true;
+        // Wide enough for all ten aggregate columns.
+        let backend = TestBackend::new(200, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let content = format!("{:?}", term.backend().buffer());
+        assert!(content.contains("DISKR"), "aggregate header missing DISKR");
+        assert!(content.contains("DISKW"), "aggregate header missing DISKW");
+    }
+
+    #[test]
     fn sorts_aggregate_rows_by_column() {
         fn agg(cpu: f64, mem: f64, user: &str) -> ConnRow {
             ConnRow::Agg(AggRow {
@@ -1696,6 +1858,8 @@ mod tests {
                 time_secs: 0.0,
                 cpu_pct: cpu,
                 mem_pct: mem,
+                disk_read_rate: 0.0,
+                disk_write_rate: 0.0,
             })
         }
         let mut rows = vec![agg(10.0, 1.0, "bob"), agg(50.0, 5.0, "amy"), agg(30.0, 3.0, "cara")];
@@ -1732,6 +1896,72 @@ mod tests {
             })
             .collect();
         assert_eq!(users, vec!["amy", "bob", "cara"]);
+    }
+
+    #[test]
+    fn sorts_aggregate_rows_by_disk_columns() {
+        let a = ConnRow::Agg(AggRow {
+            comm: "a".into(),
+            pid: Some(1),
+            count: 1,
+            rx_rate: 0.0,
+            tx_rate: 0.0,
+            user: "a".into(),
+            time_secs: 0.0,
+            cpu_pct: 0.0,
+            mem_pct: 0.0,
+            disk_read_rate: 100.0,
+            disk_write_rate: 5.0,
+        });
+        let b = ConnRow::Agg(AggRow {
+            comm: "b".into(),
+            pid: Some(2),
+            count: 1,
+            rx_rate: 0.0,
+            tx_rate: 0.0,
+            user: "b".into(),
+            time_secs: 0.0,
+            cpu_pct: 0.0,
+            mem_pct: 0.0,
+            disk_read_rate: 300.0,
+            disk_write_rate: 50.0,
+        });
+        let c = ConnRow::Agg(AggRow {
+            comm: "c".into(),
+            pid: Some(3),
+            count: 1,
+            rx_rate: 0.0,
+            tx_rate: 0.0,
+            user: "c".into(),
+            time_secs: 0.0,
+            cpu_pct: 0.0,
+            mem_pct: 0.0,
+            disk_read_rate: 200.0,
+            disk_write_rate: 20.0,
+        });
+        let mut rows = vec![a, b, c];
+
+        // DISKR descending: 300 (b), 200 (c), 100 (a).
+        sort_rows(&mut rows, SortKey::DiskR, false);
+        let dr: Vec<f64> = rows
+            .iter()
+            .map(|r| match r {
+                ConnRow::Agg(x) => x.disk_read_rate,
+                _ => 0.0,
+            })
+            .collect();
+        assert_eq!(dr, vec![300.0, 200.0, 100.0]);
+
+        // DISKW ascending: 5 (a), 20 (c), 50 (b).
+        sort_rows(&mut rows, SortKey::DiskW, true);
+        let dw: Vec<f64> = rows
+            .iter()
+            .map(|r| match r {
+                ConnRow::Agg(x) => x.disk_write_rate,
+                _ => 0.0,
+            })
+            .collect();
+        assert_eq!(dw, vec![5.0, 20.0, 50.0]);
     }
 
     #[test]

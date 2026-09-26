@@ -54,6 +54,10 @@ pub struct AggRow {
     pub cpu_pct: f64,
     /// Resident memory usage as a percentage of total RAM (htop's `MEM%`).
     pub mem_pct: f64,
+    /// Per-process disk read throughput in bytes/s, from `/proc/<pid>/io`.
+    pub disk_read_rate: f64,
+    /// Per-process disk write throughput in bytes/s, from `/proc/<pid>/io`.
+    pub disk_write_rate: f64,
 }
 
 /// htop-style per-process resource info, read from `/proc/<pid>`.
@@ -63,6 +67,10 @@ pub struct ProcInfo {
     pub cpu_pct: f64,
     pub mem_pct: f64,
     pub time_secs: f64,
+    /// Disk read throughput (bytes/s) from `/proc/<pid>/io` cumulative counters.
+    pub disk_read_rate: f64,
+    /// Disk write throughput (bytes/s) from `/proc/<pid>/io` cumulative counters.
+    pub disk_write_rate: f64,
 }
 
 type Key = (String, String, String);
@@ -93,6 +101,9 @@ pub struct ConnMonitor {
     procs: HashMap<u32, ProcInfo>,
     /// Previous (cpu ticks, instant) per pid, for computing CPU% deltas.
     proc_prev: HashMap<u32, (u64, Instant)>,
+    /// Previous (read_bytes, write_bytes, instant) per pid, for computing
+    /// per-process disk read/write throughput deltas from `/proc/<pid>/io`.
+    proc_io_prev: HashMap<u32, (u64, u64, Instant)>,
     /// Total system RAM in KiB, from `/proc/meminfo` (read once).
     mem_total_kb: u64,
 }
@@ -113,6 +124,7 @@ impl ConnMonitor {
             last_max_rows: 10,
             procs: HashMap::new(),
             proc_prev: HashMap::new(),
+            proc_io_prev: HashMap::new(),
             mem_total_kb: total_mem_kb(),
         }
     }
@@ -122,6 +134,7 @@ impl ConnMonitor {
         self.prev.clear();
         self.procs.clear();
         self.proc_prev.clear();
+        self.proc_io_prev.clear();
         self.scroll = 0;
         self.last.clear();
     }
@@ -184,6 +197,8 @@ impl ConnMonitor {
                 cpu_pct: 0.0,
                 mem_pct: 0.0,
                 time_secs: 0.0,
+                disk_read_rate: 0.0,
+                disk_write_rate: 0.0,
             };
             if let Some((utime, stime)) = read_proc_stat(pid) {
                 let total_ticks = utime + stime;
@@ -202,6 +217,21 @@ impl ConnMonitor {
                     info.mem_pct = vmrss as f64 / self.mem_total_kb as f64 * 100.0;
                 }
                 info.user = uid_to_user(uid);
+            }
+            // Per-process disk I/O from `/proc/<pid>/io` (cumulative counters).
+            // Unreadable for processes owned by other users; treated as 0.0.
+            if let Some((rb, wb)) = read_proc_io(pid) {
+                if let Some(&(prev_rb, prev_wb, prev_inst)) = self.proc_io_prev.get(&pid) {
+                    let dt = now.duration_since(prev_inst).as_secs_f64();
+                    if dt > 0.0 {
+                        info.disk_read_rate = (rb.saturating_sub(prev_rb)) as f64 / dt;
+                        info.disk_write_rate = (wb.saturating_sub(prev_wb)) as f64 / dt;
+                    }
+                }
+                self.proc_io_prev.insert(pid, (rb, wb, now));
+            } else {
+                // Cannot read I/O for this process; drop any stale baseline.
+                self.proc_io_prev.remove(&pid);
             }
             new_procs.insert(pid, info);
         }
@@ -464,6 +494,26 @@ fn read_proc_status(pid: u32) -> Option<(u32, u64)> {
     Some((uid?, vmrss?))
 }
 
+/// Read `(read_bytes, write_bytes)` from `/proc/<pid>/io`. These are cumulative
+/// counters since process start. Returns `None` when the file is unreadable
+/// (e.g. process owned by another user, or kernel `hidepid` mount option).
+fn read_proc_io(pid: u32) -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string(format!("/proc/{}/io", pid)).ok()?;
+    let mut rb: Option<u64> = None;
+    let mut wb: Option<u64> = None;
+    for line in s.lines() {
+        if rb.is_none() && line.starts_with("read_bytes:") {
+            rb = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+        } else if wb.is_none() && line.starts_with("write_bytes:") {
+            wb = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+        }
+        if rb.is_some() && wb.is_some() {
+            break;
+        }
+    }
+    Some((rb?, wb?))
+}
+
 /// Map a numeric uid to a username via `getpwuid_r`, falling back to the raw
 /// uid string when the account is not in the password database.
 fn uid_to_user(uid: u32) -> String {
@@ -607,6 +657,8 @@ impl ConnMonitor {
                         time_secs: p.map(|p| p.time_secs).unwrap_or(0.0),
                         cpu_pct: p.map(|p| p.cpu_pct).unwrap_or(0.0),
                         mem_pct: p.map(|p| p.mem_pct).unwrap_or(0.0),
+                        disk_read_rate: p.map(|p| p.disk_read_rate).unwrap_or(0.0),
+                        disk_write_rate: p.map(|p| p.disk_write_rate).unwrap_or(0.0),
                     }
                 });
             entry.count += 1;

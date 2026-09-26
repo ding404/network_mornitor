@@ -1,16 +1,19 @@
 # netmon
 
 A tiny terminal network monitor written in Rust. It shows live download and upload
-speed for one network interface, with gauges and sparkline history charts.
+speed for one network interface, plus system CPU, memory and disk read/write
+throughput, with gauges and sparkline history charts.
 
 ```
 ┌ ◉ Network Monitor  │  interface: wlp2s0  │  iface 1/4  │  n/p: iface  │  i: auto-iface  │  r: reset  │  q: quit ┐
-┌ ▼ DL / ▲ UL / CPU / MEM History (24h) ───────────────────────────────────────────┐
+┌ ▼ DL / ▲ UL / CPU / MEM / DISK R / DISK W History (24h) ───────────────────────────────────────────┐
 │ ▼ DL 1.2 MB/s  │⠀⠀⣀⡤⠖⠒⠒⠦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⠴⠒⠒⠲⢤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠴⠒⠒⠦⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡤⠖⠒⠒⠦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⠴⠒⠒⠲⢤⣀⠀⠀⠀⠀⠀⠀⠀│
 │ ▲ UL 128 KB/s  │⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡏⢹⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣰⠋⣇⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡼⢹⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡏⢧⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀│
 │ ▲ UL 128 KB/s  │⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦│
 │ ▌ CPU 23.4%   │⠀⠀⠀⠀⠀⢀⡴⠒⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉│
 │ ▌ MEM 41.8%   │⠀⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤│
+│ ▌ DISK R 2.1 MB/s │⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀│
+│ ▌ DISK W 512 KB/s │⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀│
 │             ├─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
 │ 06:00          12:00          18:00          now 14:21:03                          │
 │ Session peak: 5.4 MB/s  │  Samples: 600                                          │
@@ -30,6 +33,14 @@ The program reads the kernel counters for the selected interface from
 and divides by the measured elapsed time to get bytes per second. Download speed
 comes from the `rx_bytes` field and upload speed from the `tx_bytes` field.
 
+System disk throughput is read from `/proc/diskstats`: the program sums the
+cumulative `read_sectors` / `write_sectors` fields across **whole disks** listed in
+`/sys/block` (partitions are excluded to avoid double counting), multiplies the
+sector delta by 512 to get bytes, and divides by the elapsed time. Per-process disk
+read/write rates come from `/proc/<pid>/io` (`read_bytes` / `write_bytes`), again as
+a per-second delta between samples. System CPU% is derived from `/proc/stat` and
+memory % from `/proc/meminfo`.
+
 The default interface is detected from `/proc/net/route`: the program picks the
 interface that owns the default route. If no default route exists, it falls back
 to the first non-loopback interface listed in `/proc/net/dev`.
@@ -39,8 +50,9 @@ The program also builds a list of every non-loopback interface in
 name an interface on the command line and it is not in the list, the program
 puts it at the front of the list.
 
-All samples are stored in two ring buffers of 172800 entries, which covers 1 day
-(24 hours) at a 0.5-second (2 Hz) tick. The waveform draws the full buffer, but the
+All samples are stored in ring buffers of 172800 entries, which covers 1 day
+(24 hours) at a 0.5-second (2 Hz) tick, for each of the DL, UL, CPU, MEM, DISK R and
+DISK W histories. The waveform draws the full buffer, but the
 X-axis **scale is dynamic**: until a full day of history has accumulated, the
 available samples are stretched across the whole chart width so the (initially
 sparse) curve is always clearly visible instead of being crushed into a sliver at
@@ -142,20 +154,22 @@ to toggle it back on.
 | Area | Meaning |
 | --- | --- |
 | Title bar | Program name, the interface in use, and its position in the list |
-| DL / UL / CPU / MEM box | The current value of each metric on the left, with a hollow braille history waveform on the right spanning the last 24 hours (172800 samples @ 2 Hz) |
+| DL / UL / CPU / MEM / DISK R / DISK W box | The current value of each metric on the left, with a hollow braille history waveform on the right spanning the last 24 hours (172800 samples @ 2 Hz) |
 | Download waveform | Hollow braille line of download speed over the dynamic 24-hour window |
 | Upload waveform | Hollow braille line of upload speed over the dynamic 24-hour window |
 | CPU waveform | Hollow braille line of **system-wide** CPU utilisation (%) over the dynamic 24-hour window; the value shown is the latest reading (left-aligned under the `CPU` title) |
 | MEM waveform | Hollow braille line of **system-wide** memory usage (%) — `(MemTotal − MemAvailable) / MemTotal` — over the dynamic 24-hour window |
+| DISK R waveform | Hollow braille line (blue) of **system-wide** disk read throughput (bytes/s) over the dynamic 24-hour window, summed across whole disks from `/proc/diskstats` (sectors × 512) |
+| DISK W waveform | Hollow braille line (cyan) of **system-wide** disk write throughput (bytes/s) over the dynamic 24-hour window, from `/proc/diskstats` |
 | Footer | Session peak speed, number of stored samples, and auto-iface status (`auto: on/off`) |
 
-The DL/UL waveform scale is the maximum value inside the current window plus 10
-percent headroom, so it rescales as traffic changes. The CPU and MEM waveforms use
-a fixed 0–100 % scale. The X-axis sits at the bottom of the chart: below the
-baseline a `now HH:MM:SS` label (right edge) and adaptive `HH:MM` time labels are
-drawn on the row beneath it. The number of `HH:MM` labels scales with the terminal
-width so they never overlap, and all times are shown in **Asia/Shanghai (UTC+8)**
-wall-clock time regardless of the host's timezone.
+The DL/UL and DISK R / DISK W waveform scales are the maximum value inside the
+current window plus 10 percent headroom, so they rescale as traffic changes. The
+CPU and MEM waveforms use a fixed 0–100 % scale. The X-axis sits at the bottom of
+the chart: below the baseline a `now HH:MM:SS` label (right edge) and adaptive
+`HH:MM` time labels are drawn on the row beneath it. The number of `HH:MM` labels
+scales with the terminal width so they never overlap, and all times are shown in
+**Asia/Shanghai (UTC+8)** wall-clock time regardless of the host's timezone.
 
 ## Process & Connection Throughput
 
@@ -195,11 +209,11 @@ Two more ways to cope with a long list:
 
   ```
   ├ Top Connections 1-3/3 [agg]  ↑↓ pg:scroll c:focus a:agg /:filter ──────────┤
-  │ USER   PROC(PID)         CPU%    MEM%    TIME+        CONNS  RX          TX       │
-  │ dj     node(26951)       75.0    40.0    02:11.48         4  6.1 KB/s    2.0 KB/s │
-  │ root   sshd(882)          0.0     0.2    15:42.07         1  12.0 KB/s   4.0 KB/s │
-  │ systemd-resolve(1031)     0.1     0.5    00:03.90         2  n/a         n/a      │
-  └─────────────────────────────────────────────────────────────────────────────────────┘
+  │ USER   PROC(PID)         CPU%    MEM%    TIME+        CONNS  RX          TX          DISKR       DISKW      │
+  │ dj     node(26951)       75.0    40.0    02:11.48         4  6.1 KB/s    2.0 KB/s    1.2 MB/s    512 KB/s  │
+  │ root   sshd(882)          0.0     0.2    15:42.07         1  12.0 KB/s   4.0 KB/s    n/a         n/a       │
+  │ systemd-resolve(1031)     0.1     0.5    00:03.90         2  n/a         n/a         n/a         n/a       │
+  └────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
   ```
 
   - **USER** — the process owner, resolved from `/proc/<pid>/status` `Uid` via the
@@ -210,9 +224,14 @@ Two more ways to cope with a long list:
     (`/proc/meminfo` `MemTotal`).
   - **TIME+** — cumulative CPU time (htop format: `MM:SS.cc` under an hour,
     `HH:MM:SS` above), from `/proc/<pid>/stat`.
+  - **DISKR** / **DISKW** — the process's disk **read** / **write** throughput
+    (bytes/s), computed from the cumulative counters in `/proc/<pid>/io`
+    (`read_bytes` / `write_bytes`) as the per-second delta between samples. Shows
+    `n/a` when the file cannot be read (e.g. the process is owned by another user,
+    or the kernel `hidepid` mount option hides it).
 
-  The **system-wide** CPU and memory history are drawn as waveforms in the top box
-  (below the DL/UL waveforms), not inline here.
+  The **system-wide** CPU, memory and disk read/write history are drawn as waveforms
+  in the top box (below the DL/UL waveforms), not inline here.
 
   These columns only appear in the aggregate (by-process) view; the per-connection
   detail view keeps the `PROC(PID) / PRO / SRC / DST / HOST / SVC / RX / TX` layout.
