@@ -1,3 +1,6 @@
+mod conns;
+use conns::{AggRow, ConnMonitor, ConnStat};
+
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
@@ -13,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph, Sparkline},
+    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table},
     Frame, Terminal,
 };
 
@@ -25,6 +28,8 @@ const MAX_HISTORY: usize = 300;
 const SPARKLINE_POINTS: usize = 120;
 /// Refresh interval in milliseconds.
 const TICK_MS: u64 = 1000;
+/// Background tint for alternating rows in the connections table (zebra striping).
+const ZEBRA: Color = Color::Rgb(34, 34, 44);
 
 // ── Application State ───────────────────────────────────────────────────────
 
@@ -51,6 +56,16 @@ struct App {
     prev_tx_bytes: u64,
     /// Timestamp of the last sample.
     last_sample: Instant,
+    /// Per-connection / per-process throughput monitor.
+    conns: ConnMonitor,
+    /// Focus mode: the connections panel fills the whole screen.
+    focus_conns: bool,
+    /// Aggregate connections by process instead of listing each socket.
+    aggregate: bool,
+    /// Whether the user is currently typing a filter.
+    filter_mode: bool,
+    /// Active filter string (case-insensitive substring).
+    filter: String,
 }
 
 impl App {
@@ -67,6 +82,11 @@ impl App {
             prev_rx_bytes: 0,
             prev_tx_bytes: 0,
             last_sample: Instant::now(),
+            conns: ConnMonitor::new(),
+            focus_conns: false,
+            aggregate: false,
+            filter_mode: false,
+            filter: String::new(),
         }
     }
 
@@ -128,6 +148,9 @@ impl App {
         self.prev_rx_bytes = rx_bytes;
         self.prev_tx_bytes = tx_bytes;
         self.last_sample = now;
+
+        // Sample per-connection throughput (non-fatal on failure).
+        let _ = self.conns.sample();
 
         Ok(())
     }
@@ -268,10 +291,33 @@ fn render_sparkline(
 }
 
 /// Render UI.
-fn ui(f: &mut Frame, app: &App) {
+fn ui(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    if app.focus_conns {
+        // Focus mode: the connections panel takes the whole screen.
+        let panel_area = Layout::default()
+            .margin(1)
+            .constraints([Constraint::Min(0)])
+            .split(area)[0];
+        render_conn_panel(f, panel_area, app);
+    } else {
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Percentage(60), // top: gauges + waveforms
+                Constraint::Percentage(40), // bottom: top connections
+            ])
+            .split(area);
+        render_top(f, outer[0], app);
+        render_conn_panel(f, outer[1], app);
+    }
+}
+
+/// Render the top section: interface title, speed gauges and history sparklines.
+fn render_top(f: &mut Frame, area: Rect, app: &App) {
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
-        .margin(1)
         .constraints([
             Constraint::Length(3),  // title
             Constraint::Length(6),  // gauges
@@ -279,7 +325,7 @@ fn ui(f: &mut Frame, app: &App) {
             Constraint::Min(3),     // upload waveform
             Constraint::Length(1),  // footer
         ])
-        .split(f.area());
+        .split(area);
 
     // ── Title bar ────────────────────────────────────────────────────────
     let title = Paragraph::new(Line::from(vec![
@@ -386,6 +432,154 @@ fn ui(f: &mut Frame, app: &App) {
     f.render_widget(footer, main_layout[4]);
 }
 
+/// One row in the connections table, in either detail (per-socket) or
+/// aggregated (per-process) form.
+enum ConnRow {
+    Detail(ConnStat),
+    Agg(AggRow),
+}
+
+/// Render the Top Connections panel (detail or aggregated view) into `area`.
+fn render_conn_panel(f: &mut Frame, area: Rect, app: &mut App) {
+    let view: Vec<ConnRow> = if app.aggregate {
+        app.conns
+            .aggregate_view(&app.filter)
+            .into_iter()
+            .map(ConnRow::Agg)
+            .collect()
+    } else {
+        app.conns
+            .detail_view(&app.filter)
+            .into_iter()
+            .map(ConnRow::Detail)
+            .collect()
+    };
+    let view_len = view.len();
+    let max_rows = (area.height.saturating_sub(3) as usize).max(1); // borders + header
+    app.conns.clamp_scroll(view_len, max_rows);
+
+    let first = if view_len == 0 { 0 } else { app.conns.scroll + 1 };
+    let last = (app.conns.scroll + max_rows).min(view_len);
+    let mut title = format!(" Top Connections {}-{} ", first, last.max(first));
+    title.push_str(&format!("/{} ", view_len));
+    if app.aggregate {
+        title.push_str("[agg] ");
+    }
+    if !app.filter.is_empty() || app.filter_mode {
+        title.push_str(&format!("filter:\"{}\" ", app.filter));
+    }
+    title.push_str("↑↓ pg:scroll c:focus a:agg /:filter");
+
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    if !app.conns.available {
+        let msg = Paragraph::new(" ss unavailable — install iproute2's `ss` ").block(block);
+        f.render_widget(msg, area);
+        return;
+    }
+    if view_len == 0 {
+        let hint = if app.filter.is_empty() {
+            " no active connections "
+        } else {
+            " no connections match the filter "
+        };
+        let msg = Paragraph::new(hint).block(block);
+        f.render_widget(msg, area);
+        return;
+    }
+
+    let header = if app.aggregate {
+        Row::new(vec!["PROC(PID)", "CONNS", "RX", "TX"])
+            .style(Style::default().add_modifier(Modifier::BOLD))
+    } else {
+        Row::new(vec!["PROC(PID)", "PRO", "SRC", "DST", "HOST", "SVC", "RX", "TX"])
+            .style(Style::default().add_modifier(Modifier::BOLD))
+    };
+
+    let rows = view
+        .iter()
+        .skip(app.conns.scroll)
+        .take(max_rows)
+        .enumerate()
+        .map(|(i, row)| {
+            let global_idx = app.conns.scroll + i;
+            let style = if global_idx % 2 == 1 {
+                Style::default().bg(ZEBRA)
+            } else {
+                Style::default()
+            };
+            match row {
+                ConnRow::Agg(a) => {
+                    let proc = match a.pid {
+                        Some(p) => format!("{}({})", a.comm, p),
+                        None => a.comm.clone(),
+                    };
+                    Row::new(vec![
+                        Cell::from(proc),
+                        Cell::from(a.count.to_string()),
+                        Cell::from(format_speed(a.rx_rate as u64)),
+                        Cell::from(format_speed(a.tx_rate as u64)),
+                    ])
+                    .style(style)
+                }
+                ConnRow::Detail(c) => {
+                    let proc = match c.pid {
+                        Some(p) => format!("{}({})", c.comm, p),
+                        None => c.comm.clone(),
+                    };
+                    let rx = match c.rx_rate {
+                        Some(r) => format_speed(r as u64),
+                        None => "n/a".to_string(),
+                    };
+                    let tx = match c.tx_rate {
+                        Some(t) => format_speed(t as u64),
+                        None => "n/a".to_string(),
+                    };
+                    let host = c.host.clone().unwrap_or_else(|| "-".to_string());
+                    let svc = c.service.clone().unwrap_or_else(|| "-".to_string());
+                    Row::new(vec![
+                        Cell::from(proc),
+                        Cell::from(c.proto.clone()),
+                        Cell::from(c.local.clone()),
+                        Cell::from(c.remote.clone()),
+                        Cell::from(host),
+                        Cell::from(svc),
+                        Cell::from(rx),
+                        Cell::from(tx),
+                    ])
+                    .style(style)
+                }
+            }
+        });
+
+    let widths: Vec<Constraint> = if app.aggregate {
+        vec![
+            Constraint::Min(20),
+            Constraint::Length(7),
+            Constraint::Length(11),
+            Constraint::Length(11),
+        ]
+    } else {
+        vec![
+            Constraint::Min(14),
+            Constraint::Length(4),
+            Constraint::Min(13),
+            Constraint::Min(13),
+            Constraint::Min(12),
+            Constraint::Length(7),
+            Constraint::Length(9),
+            Constraint::Length(9),
+        ]
+    };
+
+    let table = Table::default()
+        .header(header)
+        .block(block)
+        .widths(&widths)
+        .rows(rows);
+    f.render_widget(table, area);
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
@@ -461,15 +655,44 @@ fn run_app<B: Backend>(
         let timeout = tick_duration.saturating_sub(last_tick.elapsed());
         if crossterm::event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
+                // While typing a filter, route keys to the filter buffer.
+                if app.filter_mode {
+                    match key.code {
+                        KeyCode::Char(c) => app.filter.push(c),
+                        KeyCode::Backspace => {
+                            app.filter.pop();
+                        }
+                        KeyCode::Enter | KeyCode::Esc => app.filter_mode = false,
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                         return Ok(());
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
-                        // Reset history and peak.
+                        // Reset history, peak, connection monitor and filter.
                         app.rx_history.clear();
                         app.tx_history.clear();
                         app.peak_speed = 1;
+                        app.conns.reset();
+                        app.filter.clear();
+                        app.filter_mode = false;
+                    }
+                    KeyCode::Char('/') => {
+                        // Enter filter input mode.
+                        app.filter_mode = true;
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                        // Toggle focus mode (connections fill the screen).
+                        app.focus_conns = !app.focus_conns;
+                        app.conns.scroll_top();
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        // Toggle aggregate-by-process view.
+                        app.aggregate = !app.aggregate;
+                        app.conns.scroll_top();
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Tab => {
                         // Next interface (wrap around).
@@ -481,6 +704,16 @@ fn run_app<B: Backend>(
                         if len > 0 {
                             app.switch_iface(app.iface_idx + len - 1);
                         }
+                    }
+                    KeyCode::PageUp => app.conns.scroll_page_up(),
+                    KeyCode::PageDown => app.conns.scroll_page_down(),
+                    KeyCode::Home => app.conns.scroll_top(),
+                    KeyCode::End => app.conns.scroll_bottom(),
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                        app.conns.scroll_up();
+                    }
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                        app.conns.scroll_down();
                     }
                     _ => {}
                 }
@@ -495,5 +728,90 @@ fn run_app<B: Backend>(
             }
             last_tick = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn sample_app() -> App {
+        let mut app = App::new("dummy0".to_string(), vec!["dummy0".to_string()], 0);
+        app.conns.last = vec![
+            ConnStat {
+                proto: "tcp".into(),
+                local: "10.0.0.1:1".into(),
+                remote: "10.0.0.2:2".into(),
+                comm: "procA".into(),
+                pid: Some(11),
+                rx_rate: Some(1000.0),
+                tx_rate: Some(500.0),
+                host: Some("hosta".into()),
+                service: Some("https".into()),
+            },
+            ConnStat {
+                proto: "tcp".into(),
+                local: "10.0.0.1:3".into(),
+                remote: "10.0.0.3:4".into(),
+                comm: "procB".into(),
+                pid: Some(12),
+                rx_rate: Some(20.0),
+                tx_rate: None,
+                host: None,
+                service: None,
+            },
+            ConnStat {
+                proto: "udp".into(),
+                local: "10.0.0.1:5".into(),
+                remote: "10.0.0.4:6".into(),
+                comm: "procA".into(),
+                pid: Some(11),
+                rx_rate: None,
+                tx_rate: None,
+                host: None,
+                service: Some("domain".into()),
+            },
+        ];
+        app
+    }
+
+    #[test]
+    fn renders_all_connection_modes_without_panic() {
+        let mut app = sample_app();
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+
+        // Detail view (default).
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        // Focus mode.
+        app.focus_conns = true;
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        // Aggregate view.
+        app.focus_conns = false;
+        app.aggregate = true;
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        // Filter that matches some rows.
+        app.aggregate = false;
+        app.filter = "procA".into();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        // Filter that matches nothing.
+        app.filter = "zzz".into();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn renders_unavailable_and_empty_states() {
+        let mut app = sample_app();
+        app.conns.available = false;
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| ui(f, &mut app)).unwrap();
+
+        // Empty list (ss available but no connections).
+        let mut app2 = sample_app();
+        app2.conns.last.clear();
+        app2.conns.available = true;
+        term.draw(|f| ui(f, &mut app2)).unwrap();
     }
 }
