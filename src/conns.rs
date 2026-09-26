@@ -690,7 +690,7 @@ impl ConnMonitor {
     pub fn detail_view(&self, filter: &str) -> Vec<ConnStat> {
         self.last
             .iter()
-            .filter(|c| conn_matches(c, filter))
+            .filter(|c| self.conn_matches(c, filter))
             .cloned()
             .collect()
     }
@@ -700,7 +700,7 @@ impl ConnMonitor {
     pub fn aggregate_view(&self, filter: &str) -> Vec<AggRow> {
         use std::collections::HashMap;
         let mut map: HashMap<(String, Option<u32>), AggRow> = HashMap::new();
-        for c in self.last.iter().filter(|c| conn_matches(c, filter)) {
+        for c in self.last.iter().filter(|c| self.conn_matches(c, filter)) {
             let entry = map
                 .entry((c.comm.clone(), c.pid))
                 .or_insert_with(|| {
@@ -740,23 +740,31 @@ impl ConnMonitor {
 }
 
 /// Whether a connection matches a case-insensitive substring `filter`. An empty
-/// filter matches everything.
-fn conn_matches(c: &ConnStat, filter: &str) -> bool {
-    if filter.is_empty() {
-        return true;
+/// filter matches everything. Matches against the process name, pid, local/remote
+/// addresses, resolved host/service names, and the connection owner's username
+/// (resolved from `self.procs`, which honours NSS via `getent`).
+impl ConnMonitor {
+    fn conn_matches(&self, c: &ConnStat, filter: &str) -> bool {
+        if filter.is_empty() {
+            return true;
+        }
+        let f = filter.to_ascii_lowercase();
+        let pid_s = c.pid.map(|p| p.to_string()).unwrap_or_default();
+        let mut fields: Vec<&str> = vec![
+            c.comm.as_str(),
+            pid_s.as_str(),
+            c.local.as_str(),
+            c.remote.as_str(),
+            c.host.as_deref().unwrap_or(""),
+            c.service.as_deref().unwrap_or(""),
+        ];
+        // Include the owner's username (if known) so filtering by e.g. "root" or any
+        // NSS-resolved account name works in both the aggregate and detail views.
+        if let Some(user) = c.pid.and_then(|p| self.procs.get(&p)).map(|p| p.user.as_str()) {
+            fields.push(user);
+        }
+        fields.iter().any(|s| s.to_ascii_lowercase().contains(&f))
     }
-    let f = filter.to_ascii_lowercase();
-    let pid_s = c.pid.map(|p| p.to_string()).unwrap_or_default();
-    [
-        c.comm.as_str(),
-        pid_s.as_str(),
-        c.local.as_str(),
-        c.remote.as_str(),
-        c.host.as_deref().unwrap_or(""),
-        c.service.as_deref().unwrap_or(""),
-    ]
-    .iter()
-    .any(|s| s.to_ascii_lowercase().contains(&f))
 }
 
 /// Load the port → service-name map from `/etc/services`. Missing file or
@@ -848,6 +856,43 @@ mod tests {
     fn getent_user_unknown_uid_is_none() {
         // A uid that cannot exist resolves to nothing (no panic, no fake name).
         assert!(getent_user(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn filter_matches_username_in_aggregate_and_detail() {
+        let mut cm = ConnMonitor::new();
+        // A process owned by "root" (simulating an NSS/getent-resolved name).
+        cm.procs.insert(
+            1234,
+            ProcInfo {
+                user: "root".into(),
+                cpu_pct: 0.0,
+                mem_pct: 0.0,
+                time_secs: 0.0,
+                disk_read_rate: 0.0,
+                disk_write_rate: 0.0,
+            },
+        );
+        cm.last.push(ConnStat {
+            proto: "tcp".into(),
+            local: "1.2.3.4:5".into(),
+            remote: "6.7.8.9:0".into(),
+            comm: "sshd".into(),
+            pid: Some(1234),
+            rx_rate: Some(1.0),
+            tx_rate: Some(1.0),
+            host: None,
+            service: None,
+        });
+
+        // Filtering by the owner's username must surface the connection.
+        let agg = cm.aggregate_view("root");
+        assert_eq!(agg.len(), 1);
+        assert_eq!(agg[0].user, "root");
+        assert_eq!(cm.detail_view("root").len(), 1);
+
+        // A non-matching username yields nothing.
+        assert!(cm.aggregate_view("nobody").is_empty());
     }
 
     #[test]
