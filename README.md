@@ -6,7 +6,7 @@ throughput, with gauges and sparkline history charts.
 
 ```
 ┌ ◉ Network Monitor  │  interface: wlp2s0  │  iface 1/4  │  n/p: iface  │  i: auto-iface  │  r: reset  │  q: quit ┐
-┌ ▼ DL / ▲ UL / CPU / MEM / DISK R / DISK W History (24h) ───────────────────────────────────────────┐
+┌ ▼ DL / ▲ UL / CPU / MEM / SWAP / DISK R / DISK W / DISK SPACE History (24h) ───────────────────────┐
 │ ▼ DL 1.2 MB/s  │⠀⠀⣀⡤⠖⠒⠒⠦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⠴⠒⠒⠲⢤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠴⠒⠒⠦⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡤⠖⠒⠒⠦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⠴⠒⠒⠲⢤⣀⠀⠀⠀⠀⠀⠀⠀│
 │ ▲ UL 128 KB/s  │⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡏⢹⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣰⠋⣇⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡼⢹⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⡏⢧⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀│
 │ ▲ UL 128 KB/s  │⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠴⠒⠲⢤⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠖⠒⠦│
@@ -154,7 +154,7 @@ to toggle it back on.
 | Area | Meaning |
 | --- | --- |
 | Title bar | Program name, the interface in use, and its position in the list |
-| DL / UL / CPU / MEM / DISK R / DISK W box | The current value of each metric on the left, with a hollow braille history waveform on the right spanning the last 24 hours (172800 samples @ 2 Hz) |
+| DL / UL / CPU / MEM / SWAP / DISK R / DISK W / DISK SPACE box | The current value of each metric on the left, with a hollow braille history waveform on the right spanning the last 24 hours (172800 samples @ 2 Hz). MEM is magenta, SWAP is white, DISK SPACE is gray — each its own row. DISK SPACE shows the largest `/dev` disk's usage % plus total/used/free capacity (dynamic T/G/M) and the device path (e.g. `/dev/sdd`); the waveform shows only the usage %. |
 | Download waveform | Hollow braille line of download speed over the dynamic 24-hour window |
 | Upload waveform | Hollow braille line of upload speed over the dynamic 24-hour window |
 | CPU waveform | Hollow braille line of **system-wide** CPU utilisation (%) over the dynamic 24-hour window; the value shown is the latest reading (left-aligned under the `CPU` title) |

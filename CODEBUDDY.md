@@ -66,12 +66,14 @@ Two source files, both modules of the `netmon` crate:
   `app.tick()` on timeout. `ui()` (main.rs:887) is the top-level layout split
   that calls `render_top()` (the metric box + waveforms) and
   `render_conn_panel()`.
-- `App` (main.rs:53) holds **all** persistent state: six ring-buffer
+- `App` (main.rs:53) holds **all** persistent state: eight ring-buffer
   `VecDeque` histories (`MAX_HISTORY = 172800` = 24 h @ 2 Hz), previous raw
   counters for deltas, auto-iface tracking, filter/sort state, and a
   `ConnMonitor` (`app.conns`).
 - System metrics are read directly in `main.rs` from `/proc`:
-  `read_system_cpu()` (`/proc/stat`), `read_system_mem_pct()` (`/proc/meminfo`),
+  `read_system_cpu()` (`/proc/stat`), `read_system_mem_pct()` and
+  `read_system_swap_pct()` (`/proc/meminfo`), `read_system_disk_space()`
+  (`statvfs("/")`, pct used + free bytes),
   `read_sys_disk_sectors()` (`/proc/diskstats`, summed over whole disks in
   `/sys/block`, partitions excluded). Interface speeds come from
   `/proc/net/dev` (`rx_bytes`/`tx_bytes` deltas). Default interface is detected
@@ -87,7 +89,20 @@ preserve when editing:
   + `HH:MM` labels + `now HH:MM:SS`) is drawn at the **bottom** row
   (`vrows[12].y` after the 6-metric layout) — see the earlier fix where it was
   accidentally drawn on a metric row.
-- Disk/DL/UL scales = window max + 10 % headroom; CPU/MEM are fixed 0–100 %.
+- Disk/DL/UL scales = window max + 10 % headroom; CPU/MEM/SWAP/DISK SPACE are
+  fixed 0–100 %. MEM (magenta), SWAP (white) and DISK SPACE (gray) each get
+  their own metric row. DISK SPACE is the **largest mounted `/dev` filesystem's**
+  usage % (`read_system_disk_space()` reads `/proc/mounts` directly — the same
+  source `df -h` uses — so unmounted block devices like device-mapper `dm-*`
+  that `df` never lists are never picked; it dedupes filesystems by device id
+  (`st_dev`) to avoid double-counting bind/overlay mounts, then selects the
+  mounted `/dev` filesystem with the biggest `statvfs` total capacity — including
+  a whole-disk mount like `/dev/sdd`, not just partitions — and computes used/avail
+  with `df`-style math: `used = total − f_bfree`, `avail = f_bavail`, so numbers
+  line up with `df`).
+  Its label shows total / used / free capacity with dynamic T/G/M units (like
+  `df -h`) and the actual device path (e.g. `/dev/sdd`); the waveform shows
+  only the usage %.
 - All timestamps are rendered in **Asia/Shanghai (UTC+8)** via `shanghai_hms()`,
   regardless of host timezone.
 

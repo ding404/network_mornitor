@@ -2,9 +2,12 @@ mod conns;
 use conns::{AggRow, ConnMonitor, ConnStat};
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use libc;
 
 use crossterm::{
     event::{
@@ -65,10 +68,22 @@ struct App {
     sys_cpu_history: VecDeque<f64>,
     /// System-wide memory usage history (0..100 % of total RAM), newest at the back.
     sys_mem_history: VecDeque<f64>,
+    /// System-wide swap usage history (0..100 % of total swap), newest at the back.
+    sys_swap_history: VecDeque<f64>,
     /// System-wide disk read throughput history (bytes/s), newest at the back.
     sys_disk_read_history: VecDeque<f64>,
     /// System-wide disk write throughput history (bytes/s), newest at the back.
     sys_disk_write_history: VecDeque<f64>,
+    /// System-wide disk space usage history (0..100 % used of the largest disk), newest at the back.
+    sys_disk_space_history: VecDeque<f64>,
+    /// Total capacity of the largest `/dev` disk (bytes), for the live label.
+    sys_disk_space_total: u64,
+    /// Bytes currently used on that disk's mounted filesystems, for the live label.
+    sys_disk_space_used: u64,
+    /// Bytes currently available (excluding reserved blocks) on those filesystems, for the live label.
+    sys_disk_space_avail: u64,
+    /// Device path of the largest `/dev` disk (e.g. `/dev/sdd`), for the live label.
+    sys_disk_space_dev: String,
     /// Previous cumulative disk read sectors (from /proc/diskstats) for the delta.
     prev_disk_read_sectors: u64,
     /// Previous cumulative disk write sectors for the delta.
@@ -137,8 +152,14 @@ impl App {
             tx_history: VecDeque::with_capacity(MAX_HISTORY),
             sys_cpu_history: VecDeque::with_capacity(MAX_HISTORY),
             sys_mem_history: VecDeque::with_capacity(MAX_HISTORY),
+            sys_swap_history: VecDeque::with_capacity(MAX_HISTORY),
             sys_disk_read_history: VecDeque::with_capacity(MAX_HISTORY),
             sys_disk_write_history: VecDeque::with_capacity(MAX_HISTORY),
+            sys_disk_space_history: VecDeque::with_capacity(MAX_HISTORY),
+            sys_disk_space_total: 0,
+            sys_disk_space_used: 0,
+            sys_disk_space_avail: 0,
+            sys_disk_space_dev: String::new(),
             prev_disk_read_sectors: 0,
             prev_disk_write_sectors: 0,
             prev_disk_time: Instant::now(),
@@ -346,6 +367,31 @@ impl App {
             self.sys_mem_history.pop_front();
         }
 
+        if let Some(pct) = read_system_swap_pct() {
+            self.sys_swap_history.push_back(pct.clamp(0.0, 100.0));
+        } else {
+            self.sys_swap_history.push_back(0.0);
+        }
+        if self.sys_swap_history.len() > MAX_HISTORY {
+            self.sys_swap_history.pop_front();
+        }
+
+        // System disk space usage: largest `/dev` disk. Percentage used goes to
+        // the history; total/used/avail bytes and the device path are kept for
+        // the live label.
+        if let Some((pct, total, used, avail, dev)) = read_system_disk_space() {
+            self.sys_disk_space_history.push_back(pct.clamp(0.0, 100.0));
+            self.sys_disk_space_total = total;
+            self.sys_disk_space_used = used;
+            self.sys_disk_space_avail = avail;
+            self.sys_disk_space_dev = dev;
+        } else {
+            self.sys_disk_space_history.push_back(0.0);
+        }
+        if self.sys_disk_space_history.len() > MAX_HISTORY {
+            self.sys_disk_space_history.pop_front();
+        }
+
         // System disk read/write throughput (bytes/s). Sectors are 512 bytes; we sum
         // the cumulative counters and divide by the elapsed time between ticks.
         if let Some((rsec, wsec)) = read_sys_disk_sectors() {
@@ -403,8 +449,10 @@ impl App {
         self.tx_history.clear();
         self.sys_cpu_history.clear();
         self.sys_mem_history.clear();
+        self.sys_swap_history.clear();
         self.sys_disk_read_history.clear();
         self.sys_disk_write_history.clear();
+        self.sys_disk_space_history.clear();
         self.prev_disk_read_sectors = 0;
         self.prev_disk_write_sectors = 0;
         self.prev_disk_time = Instant::now();
@@ -544,6 +592,29 @@ fn read_system_mem_pct() -> Option<f64> {
     }
 }
 
+/// Read system swap usage as a percentage of total swap from `/proc/meminfo`.
+/// Uses `SwapTotal` and `SwapFree`. When no swap is configured (`SwapTotal` is
+/// 0) it returns `Some(0.0)`. Returns `None` only if `SwapTotal` is missing.
+fn read_system_swap_pct() -> Option<f64> {
+    let content = fs::read_to_string("/proc/meminfo").ok()?;
+    let mut total: Option<u64> = None;
+    let mut free: Option<u64> = None;
+    for line in content.lines() {
+        if line.starts_with("SwapTotal:") {
+            total = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+        } else if line.starts_with("SwapFree:") {
+            free = line.split_whitespace().nth(1).and_then(|v| v.parse().ok());
+        }
+    }
+    match (total, free) {
+        (Some(t), Some(f)) if t > 0 => {
+            Some(((t.saturating_sub(f)) as f64 / t as f64) * 100.0)
+        }
+        (Some(0), _) => Some(0.0), // no swap configured
+        _ => None,
+    }
+}
+
 /// Read cumulative disk sectors read/written across all whole-block devices.
 ///
 /// `/proc/diskstats` counts both whole disks and their partitions, and a
@@ -578,6 +649,77 @@ fn read_sys_disk_sectors() -> Option<(u64, u64)> {
     Some((read_sectors, write_sectors))
 }
 
+/// Disk-space usage of the largest mounted filesystem, read the same way `df`
+/// does: from `/proc/mounts`.
+///
+/// Iterates the mounted filesystems whose source is a real `/dev` block device.
+/// Device-mapper / crypt / loop devices that `df` does not list as a mounted
+/// filesystem (e.g. `/dev/dm-0` with no filesystem on it) are skipped
+/// automatically, so the selection matches `df -h`. Bind mounts are deduplicated
+/// by filesystem id. The filesystem with the largest total capacity is picked.
+/// The math mirrors `df`: `used = total − f_bfree` and `avail = f_bavail`
+/// (reserved blocks excluded). Returns `(pct_used, total_bytes, used_bytes,
+/// avail_bytes, dev_path)` where `pct_used` is `used / (used + avail)` (0..100
+/// %), matching `df`'s Use%, and `dev_path` is the `/dev` source `df` shows. The
+/// history stores only the percentage; total/used/avail/dev are shown live in
+/// the label. Returns `None` if no suitable filesystem is found.
+fn read_system_disk_space() -> Option<(f64, u64, u64, u64, String)> {
+    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    // Dedupe filesystems by device id so bind mounts / containers (same
+    // underlying filesystem mounted at several points) are not counted twice.
+    let mut seen_fs: HashSet<u64> = HashSet::new();
+    let mut best: Option<(u64, u64, u64, String)> = None; // (total, used, avail, dev)
+    for line in mounts.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 2 {
+            continue;
+        }
+        let src = f[0];
+        if !src.starts_with("/dev/") {
+            continue;
+        }
+        let c = match CString::new(f[1]) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Identify the filesystem via its device id; skip if already seen.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::stat(c.as_ptr(), &mut st) } != 0 {
+            continue;
+        }
+        if !seen_fs.insert(st.st_dev) {
+            continue;
+        }
+        let mut stv: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut stv) } != 0 {
+            continue;
+        }
+        let fr = if stv.f_frsize > 0 {
+            stv.f_frsize
+        } else {
+            stv.f_bsize
+        };
+        let total = stv.f_blocks as u64 * fr as u64;
+        if total == 0 {
+            continue;
+        }
+        let free_total = stv.f_bfree as u64 * fr as u64; // incl. reserved
+        let avail = stv.f_bavail as u64 * fr as u64; // df "Avail"
+        let used = total.saturating_sub(free_total); // df "Used"
+        let better = best.as_ref().map_or(true, |(bt, _, _, _)| total > *bt);
+        if better {
+            best = Some((total, used, avail, src.to_string()));
+        }
+    }
+    let (total, used, avail, dev) = best?;
+    let pct = if used + avail > 0 {
+        used as f64 / (used + avail) as f64 * 100.0
+    } else {
+        0.0
+    };
+    Some((pct, total, used, avail, dev))
+}
+
 /// Format bytes/s into a human-readable string.
 fn format_speed(bytes_per_sec: u64) -> String {
     const UNITS: &[&str] = &["B/s", "KB/s", "MB/s", "GB/s", "TB/s"];
@@ -591,6 +733,22 @@ fn format_speed(bytes_per_sec: u64) -> String {
         format!("{} {}", value as u64, UNITS[unit_idx])
     } else {
         format!("{:.1} {}", value, UNITS[unit_idx])
+    }
+}
+
+/// Format a byte count into a short human-readable size with dynamic units,
+/// e.g. `12.3G`, `1.2T` or `512.0M` (binary 1024-based, like `df -h`).
+fn format_bytes_short(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    let v = bytes as f64;
+    if v >= TIB {
+        format!("{:.1}T", v / TIB)
+    } else if v >= GIB {
+        format!("{:.1}G", v / GIB)
+    } else {
+        format!("{:.1}M", v / MIB)
     }
 }
 
@@ -744,8 +902,8 @@ fn draw_waveform(
                     }
                 }
             }
-            let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
             let cell = &mut buf[(area.x + cx as u16, area.y + cy as u16)];
+            let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
             let s = ch.to_string();
             cell.set_symbol(&s);
             cell.set_style(Style::default().fg(color));
@@ -874,8 +1032,8 @@ fn draw_waveform_f(
                     }
                 }
             }
-            let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
             let cell = &mut buf[(area.x + cx as u16, area.y + cy as u16)];
+            let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
             let s = ch.to_string();
             cell.set_symbol(&s);
             cell.set_style(Style::default().fg(color));
@@ -898,7 +1056,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(31), // top: title + stats box (DL/UL/CPU/MEM/DISK R/DISK W) + footer
+                Constraint::Length(39), // top: title + stats box (DL/UL/CPU/MEM/SWAP/DISK R/DISK W/DISK SPACE) + footer
                 Constraint::Min(5),     // bottom: top connections
             ])
             .split(area);
@@ -913,7 +1071,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // title
-            Constraint::Length(27), // stats box: DL/UL/CPU/MEM/DISK R/DISK W waveforms + time axis
+            Constraint::Length(35), // stats box: DL/UL/CPU/MEM/SWAP/DISK R/DISK W/DISK SPACE waveforms + time axis
             Constraint::Length(1), // footer
         ])
         .split(area);
@@ -952,21 +1110,21 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
 
     let stats_block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" ▼ DL / ▲ UL / CPU / MEM / DISK R / DISK W History ({:.0}h) ", window_h),
+            .title(Span::styled(
+            format!(" ▼ DL / ▲ UL / CPU / MEM / SWAP / DISK R / DISK W / DISK SPACE History ({:.0}h) ", window_h),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
     let stats_inner = stats_block.inner(main_layout[1]);
     f.render_widget(stats_block, main_layout[1]);
 
-    // Six metric rows (DL, UL, CPU, MEM, DISK R, DISK W) of *equal* height,
-    // plus dividers between them and the time-axis baseline + labels row. The
-    // per-metric height is derived from the actual available space so every
-    // waveform block stays the same height. (A fixed `Length(3)` per metric
-    // would be shrunk unevenly by ratatui when the box is shorter than the
-    // sum — it keeps the first and last rows at full height and squeezes the
+    // Eight metric rows (DL, UL, CPU, MEM, SWAP, DISK R, DISK W, DISK SPACE) of
+    // *equal* height, plus dividers between them and the time-axis baseline +
+    // labels row. The per-metric height is derived from the actual available
+    // space so every waveform block stays the same height. (A fixed `Length(3)`
+    // per metric would be shrunk unevenly by ratatui when the box is shorter than
+    // the sum — it keeps the first and last rows at full height and squeezes the
     // middle ones — which looked inconsistent.)
-    let n_metrics = 6;
+    let n_metrics = 8;
     let sep_rows = (n_metrics - 1) as i32 + 2; // 5 dividers + axis baseline + labels
     let inner_h = stats_inner.height as i32;
     let metric_h = (((inner_h - sep_rows).max(0)) / n_metrics as i32).max(1) as u16;
@@ -987,7 +1145,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     // Download: [label | vdiv | sparkline].
     let dl = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
+        .constraints([Constraint::Length(26), Constraint::Length(1), Constraint::Min(20)])
         .split(vrows[0]);
     let dl_label = Paragraph::new(Line::from(Span::styled(
         format!("▼ DL {}", format_speed(app.current_rx)),
@@ -999,7 +1157,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     // Upload: [label | vdiv | sparkline].
     let ul = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
+        .constraints([Constraint::Length(26), Constraint::Length(1), Constraint::Min(20)])
         .split(vrows[2]);
     let ul_label = Paragraph::new(Line::from(Span::styled(
         format!("▲ UL {}", format_speed(app.current_tx)),
@@ -1012,7 +1170,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     // max is simply 100.0 (the waveform fills proportionally to total capacity).
     let cpu = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
+        .constraints([Constraint::Length(26), Constraint::Length(1), Constraint::Min(20)])
         .split(vrows[4]);
     let cpu_now = app.sys_cpu_history.back().copied().unwrap_or(0.0);
     let cpu_label = Paragraph::new(Line::from(Span::styled(
@@ -1025,7 +1183,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     // System MEM: [label | vdiv | waveform].
     let mem = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
+        .constraints([Constraint::Length(26), Constraint::Length(1), Constraint::Min(20)])
         .split(vrows[6]);
     let mem_now = app.sys_mem_history.back().copied().unwrap_or(0.0);
     let mem_label = Paragraph::new(Line::from(Span::styled(
@@ -1035,12 +1193,25 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(mem_label, mem[0]);
     draw_waveform_f(f, mem[2], &app.sys_mem_history, 100.0, Color::Magenta);
 
+    // System SWAP: [label | vdiv | waveform]. Values are 0..100 % of total swap.
+    let swap = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(26), Constraint::Length(1), Constraint::Min(20)])
+        .split(vrows[8]);
+    let swap_now = app.sys_swap_history.back().copied().unwrap_or(0.0);
+    let swap_label = Paragraph::new(Line::from(Span::styled(
+        format!("▌ SWAP {:.1}%", swap_now),
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(swap_label, swap[0]);
+    draw_waveform_f(f, swap[2], &app.sys_swap_history, 100.0, Color::White);
+
     // System DISK R: [label | vdiv | waveform]. Byte rates, scaled dynamically.
     let dr_max = sparkline_max_f(&app.sys_disk_read_history);
     let diskr = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
-        .split(vrows[8]);
+        .constraints([Constraint::Length(26), Constraint::Length(1), Constraint::Min(20)])
+        .split(vrows[10]);
     let diskr_now = app.sys_disk_read_history.back().copied().unwrap_or(0.0);
     let diskr_label = Paragraph::new(Line::from(Span::styled(
         format!("▌ DISK R {}", format_speed(diskr_now as u64)),
@@ -1053,8 +1224,8 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     let dw_max = sparkline_max_f(&app.sys_disk_write_history);
     let diskw = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(20), Constraint::Length(1), Constraint::Min(20)])
-        .split(vrows[10]);
+        .constraints([Constraint::Length(26), Constraint::Length(1), Constraint::Min(20)])
+        .split(vrows[12]);
     let diskw_now = app.sys_disk_write_history.back().copied().unwrap_or(0.0);
     let diskw_label = Paragraph::new(Line::from(Span::styled(
         format!("▌ DISK W {}", format_speed(diskw_now as u64)),
@@ -1062,6 +1233,33 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
     )));
     f.render_widget(diskw_label, diskw[0]);
     draw_waveform_f(f, diskw[2], &app.sys_disk_write_history, dw_max, Color::Cyan);
+
+    // System DISK SPACE: [label | vdiv | waveform]. Usage % of the largest
+    // `/dev` disk, fixed 0..100 % scale like MEM. The label also shows total /
+    // used / free capacity (dynamic T/G/M units, like `df -h`).
+    let dspace = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(26), Constraint::Length(1), Constraint::Min(20)])
+        .split(vrows[14]);
+    let dspace_now = app.sys_disk_space_history.back().copied().unwrap_or(0.0);
+    let total_str = format_bytes_short(app.sys_disk_space_total);
+    let used_str = format_bytes_short(app.sys_disk_space_used);
+    let free_str = format_bytes_short(app.sys_disk_space_avail);
+    // Line 1: percent + the actual /dev device path. Line 2: total/used/free
+    // (T/U/F) with dynamic units. Kept to two lines so it fits the label cell
+    // even when the metric row is only 2 rows tall on a short terminal.
+    let dspace_label = Paragraph::new(vec![
+        Line::from(Span::styled(
+            format!("▌ DISK {:.1}% {}", dspace_now, app.sys_disk_space_dev),
+            Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("T:{} U:{} F:{}", total_str, used_str, free_str),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]);
+    f.render_widget(dspace_label, dspace[0]);
+    draw_waveform_f(f, dspace[2], &app.sys_disk_space_history, 100.0, Color::Gray);
 
     // Draw the grid dividers directly into the buffer so the vertical and
     // horizontal lines join into clean crosses. There is a horizontal divider
@@ -1077,14 +1275,12 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
         cell.set_style(grid_style);
     }
     // Horizontal dividers + axis baseline (one cross each where they meet the vline).
-    let hlines = [
-        vrows[1].y,
-        vrows[3].y,
-        vrows[5].y,
-        vrows[7].y,
-        vrows[9].y,
-        vrows[11].y,
-    ];
+    // `base_idx` is the row that carries the time axis (just below the last metric);
+    // every odd row up to it is a divider between metrics, and `base_idx` itself is
+    // the baseline under the last waveform.
+    let base_idx = 2 * n_metrics - 1;
+    let labels_idx = 2 * n_metrics;
+    let hlines: Vec<u16> = (1..=base_idx).step_by(2).map(|i| vrows[i].y).collect();
     for &hy in &hlines {
         for x in stats_inner.x..stats_inner.x + stats_inner.width {
             let cell = &mut buf[(x, hy)];
@@ -1142,7 +1338,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
                     && label != last_label_text
                 {
                     for (i, ch) in label.chars().enumerate() {
-                        let c = &mut buf[(lx as u16 + i as u16, vrows[12].y)];
+                        let c = &mut buf[(lx as u16 + i as u16, vrows[labels_idx].y)];
                         c.set_symbol(&ch.to_string());
                         c.set_style(label_style);
                     }
@@ -1161,7 +1357,7 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
             && nlx + nlen <= stats_inner.x + stats_inner.width
         {
             for (i, ch) in now_label.chars().enumerate() {
-                let cell = &mut buf[(nlx + i as u16, vrows[12].y)];
+                let cell = &mut buf[(nlx + i as u16, vrows[labels_idx].y)];
                 cell.set_symbol(&ch.to_string());
                 cell.set_style(label_style);
             }
@@ -1646,8 +1842,10 @@ fn run_app<B: Backend>(
                         app.tx_history.clear();
                         app.sys_cpu_history.clear();
                         app.sys_mem_history.clear();
+                        app.sys_swap_history.clear();
                         app.sys_disk_read_history.clear();
                         app.sys_disk_write_history.clear();
+                        app.sys_disk_space_history.clear();
                         app.prev_disk_read_sectors = 0;
                         app.prev_disk_write_sectors = 0;
                         app.prev_disk_time = Instant::now();
