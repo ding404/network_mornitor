@@ -1,0 +1,82 @@
+name: Daily Release
+
+on:
+  schedule:
+    # GitHub Actions uses UTC; 16:00 UTC is 00:00 the next day in Asia/Shanghai.
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: rustfmt, clippy
+
+      - name: Install musl linker
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Verify
+        run: |
+          cargo fmt --all -- --check
+          cargo test --all-targets
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Build portable binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Package release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_date="$(date -u +'%Y.%m.%d')"
+          release_tag="daily-${release_date}"
+          package_name="netmon-${release_tag}-x86_64-linux-musl"
+          package_dir="dist/${package_name}"
+          archive_path="dist/${package_name}.tar.gz"
+          checksum_path="${archive_path}.sha256"
+
+          mkdir -p "${package_dir}"
+          cp target/x86_64-unknown-linux-musl/release/netmon "${package_dir}/"
+          cp README.md LICENSE "${package_dir}/"
+          tar -C dist -czf "${archive_path}" "${package_name}"
+          sha256sum "${archive_path}" > "${checksum_path}"
+
+          {
+            echo "RELEASE_TAG=${release_tag}"
+            echo "ARCHIVE_PATH=${archive_path}"
+            echo "CHECKSUM_PATH=${checksum_path}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" \
+              "${ARCHIVE_PATH}" "${CHECKSUM_PATH}" \
+              --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              "${ARCHIVE_PATH}" "${CHECKSUM_PATH}" \
+              --title "Daily release ${RELEASE_TAG#daily-}" \
+              --notes "Automated daily release built from ${GITHUB_SHA}." \
+              --prerelease
+          fi
