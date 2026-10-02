@@ -22,14 +22,14 @@ throughput, with gauges and sparkline history charts.
 │ node(26951)    tcp  127.0.0.1:51641 127.0.0.1:10808 localhost  -      6.1 KB/s 2.0 KB/s │
 │ sshd(882)      tcp  10.0.0.2:22     10.0.0.9:55123  9.9.9.9    ssh    12.0 KB/s 4.0 KB/s │
 │ resolver(1031) udp  127.0.0.53:53   8.8.8.8:53      dns.google domain n/a     n/a      │
-│   ...more rows now fit because the four stats regions are compact...              │
+│   ...the connection panel remains visible on a sufficiently tall terminal...     │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## How it works
 
 The program reads the kernel counters for the selected interface from
-`/proc/net/dev` once per second. It computes the byte delta between two samples
+`/proc/net/dev` twice per second. It computes the byte delta between two samples
 and divides by the measured elapsed time to get bytes per second. Download speed
 comes from the `rx_bytes` field and upload speed from the `tx_bytes` field.
 
@@ -51,9 +51,10 @@ name an interface on the command line and it is not in the list, the program
 puts it at the front of the list.
 
 All samples are stored in ring buffers of 172800 entries, which covers 1 day
-(24 hours) at a 0.5-second (2 Hz) tick, for each of the DL, UL, CPU, MEM, DISK R and
-DISK W histories. The waveform draws the full buffer, but the
-X-axis **scale is dynamic**: until a full day of history has accumulated, the
+(24 hours) at a 0.5-second (2 Hz) tick, for each of the DL, UL, CPU, MEM, SWAP,
+DISK SPACE, DISK R and DISK W histories. The waveform samples only the columns
+visible on screen instead of rebuilding a full-size normalised series on every
+frame. The X-axis **scale is dynamic**: until a full day of history has accumulated, the
 available samples are stretched across the whole chart width so the (initially
 sparse) curve is always clearly visible instead of being crushed into a sliver at
 the left edge of a 24h window. As more history arrives the view gradually "zooms
@@ -154,7 +155,7 @@ to toggle it back on.
 | Area | Meaning |
 | --- | --- |
 | Title bar | Program name, the interface in use, and its position in the list |
-| DL / UL / CPU / MEM / SWAP / DISK R / DISK W / DISK SPACE box | The current value of each metric on the left, with a hollow braille history waveform on the right spanning the last 24 hours (172800 samples @ 2 Hz). MEM is magenta, SWAP is white, DISK SPACE is gray — each its own row. DISK SPACE shows the largest `/dev` disk's usage % plus total/used/free capacity (dynamic T/G/M) and the device path (e.g. `/dev/sdd`); the waveform shows only the usage %. |
+| DL / UL / CPU / MEM / SWAP / DISK R / DISK W / DISK SPACE box | The current value of each metric on the left, with a hollow braille history waveform on the right spanning the last 24 hours (172800 samples @ 2 Hz). MEM is magenta, SWAP is white, DISK SPACE is gray — each its own row. DISK SPACE shows the largest `/dev` disk's usage % plus total/used/free capacity (dynamic B/K/M/G/T) and the device path (e.g. `/dev/sdd`); the waveform shows only the usage %. |
 | Download waveform | Hollow braille line of download speed over the dynamic 24-hour window |
 | Upload waveform | Hollow braille line of upload speed over the dynamic 24-hour window |
 | CPU waveform | Hollow braille line of **system-wide** CPU utilisation (%) over the dynamic 24-hour window; the value shown is the latest reading (left-aligned under the `CPU` title) |
@@ -258,9 +259,11 @@ program keeps running.
 ## Project layout
 
 ```
-src/main.rs      TUI, counter reading, sampling, and layout
-src/conns.rs     per-connection/process sampling: runs `ss`, parses its output,
-                 and computes per-connection RX/TX rates
+src/main.rs      application state, interface counters, event loop, startup
+src/metrics.rs   Linux system metric readers from `/proc`, `/sys`, mounts, and
+                 `statvfs`
+src/conns.rs     background `ss`/process sampler, connection parsing, and rates
+src/ui.rs        metric waveforms, layout, connection table, and sorting
 Cargo.toml       package manifest (ratatui 0.29, crossterm 0.28)
 ```
 
@@ -280,6 +283,15 @@ Cargo.toml       package manifest (ratatui 0.29, crossterm 0.28)
   running.
 - UDP connections have no per-socket throughput rate (the kernel does not track
   cumulative UDP bytes), so their RX/TX columns always read `n/a`.
+- On terminals shorter than 46 rows, the program switches to the connection view
+  automatically so the panel remains usable instead of being squeezed out by the
+  metric layout.
+- Disk-space monitoring prefers the largest mounted `/dev` filesystem. On
+  overlay/container filesystems it falls back to the root filesystem and labels it
+  `rootfs`.
+- If the active interface disappears after startup, its displayed rate is reset to
+  zero until the interface becomes available again; the interface list itself is
+  still refreshed only on restart.
 
 ## Dependencies
 

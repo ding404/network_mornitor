@@ -16,8 +16,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
-use libc;
-
 /// One sampled connection (or UDP socket).
 #[derive(Clone)]
 pub struct ConnStat {
@@ -75,11 +73,10 @@ pub struct ProcInfo {
 
 type Key = (String, String, String);
 
-/// Tracks the previous sample of every connection and produces a sorted list
-/// of the current top connections on each `sample()` call.
-pub struct ConnMonitor {
+/// Worker-owned sampler that runs `ss` and `/proc` reads without touching UI
+/// interaction state.
+struct ConnSampler {
     prev: HashMap<Key, (u64, u64, Instant)>,
-    pub scroll: usize,
     pub last: Vec<ConnStat>,
     /// Whether the last `ss` invocation succeeded. `false` when `ss` is
     /// missing or fails, in which case `last` is empty.
@@ -94,8 +91,6 @@ pub struct ConnMonitor {
     pending: HashSet<IpAddr>,
     /// Port → service-name map loaded from `/etc/services`.
     services: HashMap<(u16, String), String>,
-    /// Last known visible row count, used to compute page-scroll steps.
-    last_max_rows: usize,
     /// Per-pid resource info (USER/CPU%/MEM%/TIME+) for processes with at least
     /// one visible connection. Rebuilt each `sample()`.
     procs: HashMap<u32, ProcInfo>,
@@ -113,12 +108,11 @@ pub struct ConnMonitor {
     uid_cache: HashMap<u32, String>,
 }
 
-impl ConnMonitor {
-    pub fn new() -> Self {
+impl ConnSampler {
+    fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             prev: HashMap::new(),
-            scroll: 0,
             last: Vec::new(),
             available: true,
             tx,
@@ -126,7 +120,6 @@ impl ConnMonitor {
             host_cache: HashMap::new(),
             pending: HashSet::new(),
             services: load_services(),
-            last_max_rows: 10,
             procs: HashMap::new(),
             proc_prev: HashMap::new(),
             proc_io_prev: HashMap::new(),
@@ -135,55 +128,14 @@ impl ConnMonitor {
         }
     }
 
-    /// Clear history, peak baseline and scroll position.
+    /// Clear rate baselines and process state.
     pub fn reset(&mut self) {
         self.prev.clear();
         self.procs.clear();
         self.proc_prev.clear();
         self.proc_io_prev.clear();
-        self.scroll = 0;
         self.last.clear();
-    }
-
-    pub fn scroll_up(&mut self) {
-        if self.scroll > 0 {
-            self.scroll -= 1;
-        }
-    }
-
-    pub fn scroll_down(&mut self) {
-        self.scroll += 1;
-    }
-
-    /// Scroll up/down by roughly one screen.
-    pub fn scroll_page_up(&mut self) {
-        let step = self.last_max_rows.max(1);
-        self.scroll = self.scroll.saturating_sub(step);
-    }
-
-    pub fn scroll_page_down(&mut self) {
-        let step = self.last_max_rows.max(1);
-        self.scroll = self.scroll.saturating_add(step);
-    }
-
-    /// Jump to the first / last row (last is applied on the next clamp).
-    pub fn scroll_top(&mut self) {
-        self.scroll = 0;
-    }
-
-    pub fn scroll_bottom(&mut self) {
-        self.scroll = usize::MAX;
-    }
-
-    /// Keep `scroll` within `[0, view_len - max_rows]`. `view_len` is the length
-    /// of the currently displayed view (detail or aggregated), which may differ
-    /// from `self.last.len()`. Called from the renderer each frame.
-    pub fn clamp_scroll(&mut self, view_len: usize, max_rows: usize) {
-        self.last_max_rows = max_rows;
-        let max_scroll = view_len.saturating_sub(max_rows);
-        if self.scroll > max_scroll {
-            self.scroll = max_scroll;
-        }
+        self.available = true;
     }
 
     /// Recompute `self.procs` for every pid present in `conns`, and update
@@ -246,10 +198,9 @@ impl ConnMonitor {
     }
 
     /// Run `ss`, parse it, compute per-connection rates and store the sorted
-    /// result in `self.last`. Errors are swallowed: on failure `available` is
-    /// set to `false` and the list is cleared so the UI can show a message,
-    /// but the rest of the program keeps running.
-    pub fn sample(&mut self) -> io::Result<()> {
+    /// result in `self.last`. Errors are swallowed at the worker boundary: on
+    /// failure `available` is set to `false` and the list is cleared.
+    fn sample(&mut self) -> io::Result<()> {
         let output = match Command::new("ss").args(["-tunpi"]).output() {
             Ok(o) => o,
             Err(e) => {
@@ -433,6 +384,167 @@ impl ConnMonitor {
     }
 }
 
+enum WorkerCommand {
+    Sample(u64),
+    Reset,
+    Shutdown,
+}
+
+struct WorkerSnapshot {
+    generation: u64,
+    available: bool,
+    last: Vec<ConnStat>,
+    procs: HashMap<u32, ProcInfo>,
+}
+
+/// UI-facing connection state. Expensive `ss` and `/proc/<pid>` reads happen in
+/// a dedicated worker; this object only owns the latest immutable snapshot and
+/// the interaction state used by the renderer.
+pub struct ConnMonitor {
+    pub scroll: usize,
+    pub last: Vec<ConnStat>,
+    pub available: bool,
+    procs: HashMap<u32, ProcInfo>,
+    last_max_rows: usize,
+    command_tx: mpsc::Sender<WorkerCommand>,
+    snapshot_rx: mpsc::Receiver<WorkerSnapshot>,
+    generation: u64,
+    sample_pending: bool,
+}
+
+impl ConnMonitor {
+    pub fn new() -> Self {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut sampler = ConnSampler::new();
+            while let Ok(command) = command_rx.recv() {
+                match command {
+                    WorkerCommand::Sample(generation) => {
+                        let result = sampler.sample();
+                        let (available, last, procs) = match result {
+                            Ok(()) => (
+                                sampler.available,
+                                sampler.last.clone(),
+                                sampler.procs.clone(),
+                            ),
+                            Err(_) => (false, Vec::new(), HashMap::new()),
+                        };
+                        if snapshot_tx
+                            .send(WorkerSnapshot {
+                                generation,
+                                available,
+                                last,
+                                procs,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    WorkerCommand::Reset => {
+                        sampler.reset();
+                    }
+                    WorkerCommand::Shutdown => break,
+                }
+            }
+        });
+        Self {
+            scroll: 0,
+            last: Vec::new(),
+            available: true,
+            procs: HashMap::new(),
+            last_max_rows: 10,
+            command_tx,
+            snapshot_rx,
+            generation: 0,
+            sample_pending: false,
+        }
+    }
+
+    /// Submit a sampling request without waiting for `ss` or `/proc` reads.
+    /// Completed snapshots are applied before and after submission.
+    pub fn sample(&mut self) -> io::Result<()> {
+        self.poll_worker();
+        if !self.sample_pending {
+            self.command_tx
+                .send(WorkerCommand::Sample(self.generation))
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "connection worker stopped")
+                })?;
+            self.sample_pending = true;
+        }
+        self.poll_worker();
+        Ok(())
+    }
+
+    fn poll_worker(&mut self) {
+        while let Ok(snapshot) = self.snapshot_rx.try_recv() {
+            if snapshot.generation != self.generation {
+                continue;
+            }
+            self.sample_pending = false;
+            self.available = snapshot.available;
+            self.last = snapshot.last;
+            self.procs = snapshot.procs;
+        }
+    }
+
+    /// Clear history, rate baselines, and scroll position in both UI and worker
+    /// state. Generation IDs discard any snapshot produced before the reset.
+    pub fn reset(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        let _ = self.command_tx.send(WorkerCommand::Reset);
+        self.sample_pending = false;
+        self.procs.clear();
+        self.scroll = 0;
+        self.last.clear();
+        self.available = true;
+    }
+
+    pub fn scroll_up(&mut self) {
+        if self.scroll > 0 {
+            self.scroll -= 1;
+        }
+    }
+
+    pub fn scroll_down(&mut self) {
+        self.scroll += 1;
+    }
+
+    pub fn scroll_page_up(&mut self) {
+        let step = self.last_max_rows.max(1);
+        self.scroll = self.scroll.saturating_sub(step);
+    }
+
+    pub fn scroll_page_down(&mut self) {
+        let step = self.last_max_rows.max(1);
+        self.scroll = self.scroll.saturating_add(step);
+    }
+
+    pub fn scroll_top(&mut self) {
+        self.scroll = 0;
+    }
+
+    pub fn scroll_bottom(&mut self) {
+        self.scroll = usize::MAX;
+    }
+
+    pub fn clamp_scroll(&mut self, view_len: usize, max_rows: usize) {
+        self.last_max_rows = max_rows;
+        let max_scroll = view_len.saturating_sub(max_rows);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
+        }
+    }
+}
+
+impl Drop for ConnMonitor {
+    fn drop(&mut self) {
+        let _ = self.command_tx.send(WorkerCommand::Shutdown);
+    }
+}
+
 /// Parse `users:(("name",pid=N,fd=M), ...)` and return the first owner's
 /// comm and pid. Returns `("-", None)` when no owner is visible (e.g. owned by
 /// another user, shown as `users:(())`).
@@ -451,15 +563,13 @@ fn parse_users(s: &str) -> (String, Option<u32>) {
         None => return ("-".to_string(), None),
     };
     let name = after_open[..comma].trim_matches('"').to_string();
-    let pid = after_open[comma..]
-        .find("pid=")
-        .and_then(|p| {
-            let digs: String = after_open[comma + p + 4..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            digs.parse::<u32>().ok()
-        });
+    let pid = after_open[comma..].find("pid=").and_then(|p| {
+        let digs: String = after_open[comma + p + 4..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digs.parse::<u32>().ok()
+    });
     (name, pid)
 }
 
@@ -481,7 +591,11 @@ fn total_mem_kb() -> u64 {
     if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
         for line in s.lines() {
             if line.starts_with("MemTotal:") {
-                if let Some(v) = line.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()) {
+                if let Some(v) = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|x| x.parse::<u64>().ok())
+                {
                     return v;
                 }
             }
@@ -512,9 +626,15 @@ fn read_proc_status(pid: u32) -> Option<(u32, u64)> {
     let mut vmrss: Option<u64> = None;
     for line in s.lines() {
         if uid.is_none() && line.starts_with("Uid:") {
-            uid = line.split_whitespace().nth(1).and_then(|v| v.parse::<u32>().ok());
+            uid = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u32>().ok());
         } else if line.starts_with("VmRSS:") {
-            vmrss = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+            vmrss = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok());
         }
         if uid.is_some() && vmrss.is_some() {
             break;
@@ -532,9 +652,15 @@ fn read_proc_io(pid: u32) -> Option<(u64, u64)> {
     let mut wb: Option<u64> = None;
     for line in s.lines() {
         if rb.is_none() && line.starts_with("read_bytes:") {
-            rb = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+            rb = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok());
         } else if wb.is_none() && line.starts_with("write_bytes:") {
-            wb = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+            wb = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok());
         }
         if rb.is_some() && wb.is_some() {
             break;
@@ -633,7 +759,10 @@ fn reverse_lookup(ip: IpAddr) -> Option<String> {
                 };
                 let p = &mut ss as *mut _ as *mut libc::sockaddr_in;
                 *p = sin;
-                (ss, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+                (
+                    ss,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
             }
             SocketAddr::V6(v6) => {
                 let sin6 = libc::sockaddr_in6 {
@@ -647,7 +776,10 @@ fn reverse_lookup(ip: IpAddr) -> Option<String> {
                 };
                 let p = &mut ss as *mut _ as *mut libc::sockaddr_in6;
                 *p = sin6;
-                (ss, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+                (
+                    ss,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
             }
         }
     };
@@ -675,7 +807,7 @@ fn reverse_lookup(ip: IpAddr) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-impl ConnMonitor {
+impl ConnSampler {
     /// Look up the service name for a `(port, proto)` pair from `/etc/services`.
     fn lookup_service(&self, port: u16, proto: &str) -> Option<String> {
         self.services
@@ -701,24 +833,22 @@ impl ConnMonitor {
         use std::collections::HashMap;
         let mut map: HashMap<(String, Option<u32>), AggRow> = HashMap::new();
         for c in self.last.iter().filter(|c| self.conn_matches(c, filter)) {
-            let entry = map
-                .entry((c.comm.clone(), c.pid))
-                .or_insert_with(|| {
-                    let p = c.pid.and_then(|p| self.procs.get(&p));
-                    AggRow {
-                        comm: c.comm.clone(),
-                        pid: c.pid,
-                        count: 0,
-                        rx_rate: 0.0,
-                        tx_rate: 0.0,
-                        user: p.map(|p| p.user.clone()).unwrap_or_else(|| "-".to_string()),
-                        time_secs: p.map(|p| p.time_secs).unwrap_or(0.0),
-                        cpu_pct: p.map(|p| p.cpu_pct).unwrap_or(0.0),
-                        mem_pct: p.map(|p| p.mem_pct).unwrap_or(0.0),
-                        disk_read_rate: p.map(|p| p.disk_read_rate).unwrap_or(0.0),
-                        disk_write_rate: p.map(|p| p.disk_write_rate).unwrap_or(0.0),
-                    }
-                });
+            let entry = map.entry((c.comm.clone(), c.pid)).or_insert_with(|| {
+                let p = c.pid.and_then(|p| self.procs.get(&p));
+                AggRow {
+                    comm: c.comm.clone(),
+                    pid: c.pid,
+                    count: 0,
+                    rx_rate: 0.0,
+                    tx_rate: 0.0,
+                    user: p.map(|p| p.user.clone()).unwrap_or_else(|| "-".to_string()),
+                    time_secs: p.map(|p| p.time_secs).unwrap_or(0.0),
+                    cpu_pct: p.map(|p| p.cpu_pct).unwrap_or(0.0),
+                    mem_pct: p.map(|p| p.mem_pct).unwrap_or(0.0),
+                    disk_read_rate: p.map(|p| p.disk_read_rate).unwrap_or(0.0),
+                    disk_write_rate: p.map(|p| p.disk_write_rate).unwrap_or(0.0),
+                }
+            });
             entry.count += 1;
             entry.rx_rate += c.rx_rate.unwrap_or(0.0);
             entry.tx_rate += c.tx_rate.unwrap_or(0.0);
@@ -760,7 +890,11 @@ impl ConnMonitor {
         ];
         // Include the owner's username (if known) so filtering by e.g. "root" or any
         // NSS-resolved account name works in both the aggregate and detail views.
-        if let Some(user) = c.pid.and_then(|p| self.procs.get(&p)).map(|p| p.user.as_str()) {
+        if let Some(user) = c
+            .pid
+            .and_then(|p| self.procs.get(&p))
+            .map(|p| p.user.as_str())
+        {
             fields.push(user);
         }
         fields.iter().any(|s| s.to_ascii_lowercase().contains(&f))
@@ -830,14 +964,19 @@ mod tests {
     #[test]
     fn services_map_loads_common_ports() {
         let m = load_services();
-        assert_eq!(m.get(&(443, "tcp".to_string())).map(|s| s.as_str()), Some("https"));
-        assert_eq!(m.get(&(53, "udp".to_string())).map(|s| s.as_str()), Some("domain"));
+        assert_eq!(
+            m.get(&(443, "tcp".to_string())).map(|s| s.as_str()),
+            Some("https")
+        );
+        assert_eq!(
+            m.get(&(53, "udp".to_string())).map(|s| s.as_str()),
+            Some("domain")
+        );
     }
 
     #[test]
     fn parse_users_finds_first_owner() {
-        let (comm, pid) =
-            parse_users(r#"users:(("node-MainThread",pid=26951,fd=24))"#);
+        let (comm, pid) = parse_users(r#"users:(("node-MainThread",pid=26951,fd=24))"#);
         assert_eq!(comm, "node-MainThread");
         assert_eq!(pid, Some(26951));
     }
@@ -928,9 +1067,39 @@ mod tests {
     fn aggregate_view_groups_by_process() {
         let mut m = ConnMonitor::new();
         m.last = vec![
-            ConnStat { proto: "tcp".into(), local: "1.1.1.1:1".into(), remote: "2.2.2.2:2".into(), comm: "app".into(), pid: Some(1), rx_rate: Some(100.0), tx_rate: Some(50.0), host: None, service: None },
-            ConnStat { proto: "tcp".into(), local: "1.1.1.1:3".into(), remote: "2.2.2.2:4".into(), comm: "app".into(), pid: Some(1), rx_rate: Some(200.0), tx_rate: Some(0.0), host: None, service: None },
-            ConnStat { proto: "udp".into(), local: "1.1.1.1:5".into(), remote: "3.3.3.3:6".into(), comm: "other".into(), pid: Some(2), rx_rate: None, tx_rate: None, host: None, service: None },
+            ConnStat {
+                proto: "tcp".into(),
+                local: "1.1.1.1:1".into(),
+                remote: "2.2.2.2:2".into(),
+                comm: "app".into(),
+                pid: Some(1),
+                rx_rate: Some(100.0),
+                tx_rate: Some(50.0),
+                host: None,
+                service: None,
+            },
+            ConnStat {
+                proto: "tcp".into(),
+                local: "1.1.1.1:3".into(),
+                remote: "2.2.2.2:4".into(),
+                comm: "app".into(),
+                pid: Some(1),
+                rx_rate: Some(200.0),
+                tx_rate: Some(0.0),
+                host: None,
+                service: None,
+            },
+            ConnStat {
+                proto: "udp".into(),
+                local: "1.1.1.1:5".into(),
+                remote: "3.3.3.3:6".into(),
+                comm: "other".into(),
+                pid: Some(2),
+                rx_rate: None,
+                tx_rate: None,
+                host: None,
+                service: None,
+            },
         ];
         let agg = m.aggregate_view("");
         assert_eq!(agg.len(), 2);
@@ -946,13 +1115,40 @@ mod tests {
     fn detail_view_filters_by_substring() {
         let mut m = ConnMonitor::new();
         m.last = vec![
-            ConnStat { proto: "tcp".into(), local: "1.1.1.1:1".into(), remote: "2.2.2.2:2".into(), comm: "chrome".into(), pid: Some(1), rx_rate: None, tx_rate: None, host: None, service: None },
-            ConnStat { proto: "tcp".into(), local: "1.1.1.1:3".into(), remote: "2.2.2.2:4".into(), comm: "ssh".into(), pid: Some(2), rx_rate: None, tx_rate: None, host: None, service: None },
+            ConnStat {
+                proto: "tcp".into(),
+                local: "1.1.1.1:1".into(),
+                remote: "2.2.2.2:2".into(),
+                comm: "chrome".into(),
+                pid: Some(1),
+                rx_rate: None,
+                tx_rate: None,
+                host: None,
+                service: None,
+            },
+            ConnStat {
+                proto: "tcp".into(),
+                local: "1.1.1.1:3".into(),
+                remote: "2.2.2.2:4".into(),
+                comm: "ssh".into(),
+                pid: Some(2),
+                rx_rate: None,
+                tx_rate: None,
+                host: None,
+                service: None,
+            },
         ];
         let f = m.detail_view("ssh");
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].comm, "ssh");
         assert_eq!(m.detail_view("nomatch").len(), 0);
     }
-}
 
+    #[test]
+    fn reset_allows_connection_monitor_recovery() {
+        let mut m = ConnMonitor::new();
+        m.available = false;
+        m.reset();
+        assert!(m.available);
+    }
+}
