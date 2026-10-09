@@ -737,7 +737,11 @@ fn aggregate_user_rows(sessions: &[LoginSession], processes: &[SessionProcess]) 
 }
 
 fn sort_user_rows(rows: &mut [UserRow]) {
-    rows.sort_by(|a, b| b.online.cmp(&a.online).then_with(|| a.user.cmp(&b.user)));
+    rows.sort_by(|a, b| {
+        b.online
+            .cmp(&a.online)
+            .then_with(|| b.last_login.cmp(&a.last_login))
+    });
 }
 
 /// Infer one session per `(user, pts/N)` from currently running terminal
@@ -1683,34 +1687,34 @@ mod tests {
     }
 
     #[test]
-    fn sorts_online_users_before_offline_then_by_name() {
+    fn sorts_online_users_before_offline_then_by_latest_login() {
         let mut rows = vec![
             UserRow {
-                user: "zoe".into(),
+                user: "bob".into(),
                 online: false,
                 sessions: 0,
-                last_login: 0,
-                last_process: None,
-            },
-            UserRow {
-                user: "bob".into(),
-                online: true,
-                sessions: 1,
-                last_login: 0,
+                last_login: 100,
                 last_process: None,
             },
             UserRow {
                 user: "alice".into(),
                 online: true,
                 sessions: 1,
-                last_login: 0,
+                last_login: 200,
+                last_process: None,
+            },
+            UserRow {
+                user: "zoe".into(),
+                online: true,
+                sessions: 1,
+                last_login: 300,
                 last_process: None,
             },
             UserRow {
                 user: "aaron".into(),
                 online: false,
                 sessions: 0,
-                last_login: 0,
+                last_login: 400,
                 last_process: None,
             },
         ];
@@ -1719,7 +1723,7 @@ mod tests {
 
         assert_eq!(
             rows.iter().map(|row| row.user.as_str()).collect::<Vec<_>>(),
-            ["alice", "bob", "aaron", "zoe"]
+            ["zoe", "alice", "aaron", "bob"]
         );
     }
 
