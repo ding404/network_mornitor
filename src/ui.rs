@@ -692,7 +692,24 @@ fn render_user_table(
     selectable: bool,
 ) {
     let max_rows = area.height.saturating_sub(3) as usize;
-    app.conns.clamp_scroll(rows.len(), max_rows.max(1));
+    let page_size = max_rows.max(1);
+    if selectable {
+        if rows.is_empty() {
+            app.user_cursor = 0;
+            app.conns.scroll = 0;
+        } else {
+            app.user_cursor = app.user_cursor.min(rows.len() - 1);
+            let max_scroll = rows.len().saturating_sub(page_size);
+            if app.user_cursor < app.conns.scroll {
+                app.conns.scroll = app.user_cursor;
+            } else if app.user_cursor >= app.conns.scroll.saturating_add(page_size) {
+                app.conns.scroll = app.user_cursor + 1 - page_size;
+            }
+            app.conns.scroll = app.conns.scroll.min(max_scroll);
+        }
+    } else {
+        app.conns.clamp_scroll(rows.len(), page_size);
+    }
     let first = if rows.is_empty() {
         0
     } else {
@@ -749,7 +766,8 @@ fn render_user_table(
         .take(max_rows.max(1))
         .enumerate()
         .map(|(index, user)| {
-            let style = if selectable && index == 0 {
+            let selected = selectable && app.conns.scroll + index == app.user_cursor;
+            let style = if selected {
                 Style::default()
                     .fg(Color::White)
                     .bg(Color::Blue)

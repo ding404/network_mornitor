@@ -158,6 +158,8 @@ struct App {
     show_users: bool,
     /// Selected username whose individual sessions are shown in the user panel.
     selected_user: Option<String>,
+    /// Cursor in the aggregate user list; independent from table scroll offset.
+    user_cursor: usize,
     /// Aggregate connections by process instead of listing each socket.
     aggregate: bool,
     /// Whether the user is currently typing a filter.
@@ -213,6 +215,7 @@ impl App {
             focus_conns: false,
             show_users: false,
             selected_user: None,
+            user_cursor: 0,
             aggregate: false,
             filter_mode: false,
             filter: String::new(),
@@ -675,6 +678,15 @@ fn format_epoch_datetime(timestamp: u64) -> String {
     )
 }
 
+fn move_user_cursor(app: &mut App, delta: isize) {
+    let last = app.conns.users.len().saturating_sub(1);
+    if delta < 0 {
+        app.user_cursor = app.user_cursor.saturating_sub((-delta) as usize);
+    } else {
+        app.user_cursor = app.user_cursor.saturating_add(delta as usize).min(last);
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
@@ -784,6 +796,7 @@ fn run_app<B: Backend>(
                             app.filter.clear();
                             app.filter_mode = false;
                             app.selected_user = None;
+                            app.user_cursor = 0;
                         }
                         KeyCode::Char('/') => {
                             // Enter filter input mode.
@@ -797,10 +810,11 @@ fn run_app<B: Backend>(
                         KeyCode::Char('u') | KeyCode::Char('U') => {
                             app.show_users = !app.show_users;
                             app.selected_user = None;
+                            app.user_cursor = 0;
                             app.conns.scroll_top();
                         }
                         KeyCode::Enter if app.show_users && app.selected_user.is_none() => {
-                            if let Some(user) = app.conns.users.get(app.conns.scroll) {
+                            if let Some(user) = app.conns.users.get(app.user_cursor) {
                                 app.selected_user = Some(user.user.clone());
                                 app.conns.scroll_top();
                             }
@@ -835,8 +849,26 @@ fn run_app<B: Backend>(
                         }
                         KeyCode::PageUp => app.conns.scroll_page_up(),
                         KeyCode::PageDown => app.conns.scroll_page_down(),
+                        KeyCode::Home if app.show_users && app.selected_user.is_none() => {
+                            app.user_cursor = 0;
+                            app.conns.scroll_top();
+                        }
+                        KeyCode::End if app.show_users && app.selected_user.is_none() => {
+                            app.user_cursor = app.conns.users.len().saturating_sub(1);
+                            app.conns.scroll_bottom();
+                        }
                         KeyCode::Home => app.conns.scroll_top(),
                         KeyCode::End => app.conns.scroll_bottom(),
+                        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K')
+                            if app.show_users && app.selected_user.is_none() =>
+                        {
+                            move_user_cursor(app, -1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J')
+                            if app.show_users && app.selected_user.is_none() =>
+                        {
+                            move_user_cursor(app, 1);
+                        }
                         KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
                             app.conns.scroll_up();
                         }
@@ -1278,6 +1310,48 @@ mod tests {
         assert!(first_status
             .modifier
             .contains(ratatui::style::Modifier::BOLD));
+
+        app.user_cursor = 1;
+        term.draw(|f| ui(f, &mut app)).unwrap();
+        let second_user = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "b" && cell.bg == ratatui::style::Color::Blue)
+            .unwrap();
+        assert!(second_user
+            .modifier
+            .contains(ratatui::style::Modifier::BOLD));
+    }
+
+    #[test]
+    fn user_cursor_moves_when_all_users_fit_in_view() {
+        let mut app = sample_app();
+        app.show_users = true;
+        app.conns.users = vec![
+            UserRow {
+                user: "alice".into(),
+                online: true,
+                sessions: 1,
+                last_login: 2,
+                last_process: None,
+                session_rows: Vec::new(),
+            },
+            UserRow {
+                user: "bob".into(),
+                online: false,
+                sessions: 0,
+                last_login: 1,
+                last_process: None,
+                session_rows: Vec::new(),
+            },
+        ];
+
+        move_user_cursor(&mut app, 1);
+
+        assert_eq!(app.user_cursor, 1);
+        assert_eq!(app.conns.scroll, 0);
     }
 
     #[test]
