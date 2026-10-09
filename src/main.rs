@@ -1254,17 +1254,29 @@ mod tests {
             session_rows: vec![
                 UserSession {
                     user: "dj".into(),
-                    tty: "pts/2".into(),
+                    tty: "pts/1".into(),
                     online: true,
                     last_login: 1_672_531_200,
-                    last_process: None,
+                    last_process: Some(SessionProcess {
+                        user: "dj".into(),
+                        tty: "pts/1".into(),
+                        comm: "bash".into(),
+                        started_at: 1_600_000_000,
+                        start_ticks: 1,
+                    }),
                 },
                 UserSession {
                     user: "dj".into(),
-                    tty: "pts/1".into(),
+                    tty: "pts/2".into(),
                     online: true,
                     last_login: 1_609_459_200,
-                    last_process: None,
+                    last_process: Some(SessionProcess {
+                        user: "dj".into(),
+                        tty: "pts/2".into(),
+                        comm: "vim".into(),
+                        started_at: 1_700_000_000,
+                        start_ticks: 2,
+                    }),
                 },
             ],
         }];
@@ -1283,6 +1295,7 @@ mod tests {
         assert!(rendered.contains("Sessions for dj"));
         assert!(rendered.contains("pts/2"));
         assert!(rendered.contains("pts/1"));
+        assert!(rendered.find("pts/2").unwrap() < rendered.find("pts/1").unwrap());
         assert_eq!(rendered.matches("2021-01-01 08:00:00").count(), 1);
         assert!(rendered.contains("2023-01-01 08:00:00"));
     }

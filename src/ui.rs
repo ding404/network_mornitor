@@ -615,7 +615,7 @@ fn render_user_panel(f: &mut Frame, area: Rect, app: &mut App) {
     let users = app.conns.users.clone();
     if let Some(selected) = app.selected_user.clone() {
         if let Some(user) = users.iter().find(|user| user.user == selected) {
-            let rows = user
+            let mut rows: Vec<UserTableRow> = user
                 .session_rows
                 .iter()
                 .map(|session| UserTableRow {
@@ -627,6 +627,7 @@ fn render_user_panel(f: &mut Frame, area: Rect, app: &mut App) {
                     last_process: session.last_process.clone(),
                 })
                 .collect();
+            sort_session_table_rows(&mut rows);
             render_user_table(
                 f,
                 area,
@@ -652,6 +653,24 @@ fn render_user_panel(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     render_user_table(f, area, app, "Users".to_string(), rows, " no user records ");
+}
+
+fn sort_session_table_rows(rows: &mut [UserTableRow]) {
+    rows.sort_by(|a, b| {
+        let a_started = a
+            .last_process
+            .as_ref()
+            .map(|process| process.start_ticks)
+            .unwrap_or(0);
+        let b_started = b
+            .last_process
+            .as_ref()
+            .map(|process| process.start_ticks)
+            .unwrap_or(0);
+        b_started
+            .cmp(&a_started)
+            .then_with(|| b.last_login.cmp(&a.last_login))
+    });
 }
 
 fn render_user_table(
