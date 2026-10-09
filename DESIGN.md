@@ -80,7 +80,10 @@ utmp and lastlog. When utmp is unavailable, sessions are inferred from running
 processes with a `pts/N` controlling terminal. Accounts with no lastlog record
 are omitted when offline. A completed command or shell builtin is not
 recoverable from `/proc`, so the process column describes the newest process
-that is still running.
+that is still running. Enter on a user row opens its terminal-specific session
+rows, sorted by login time descending; Esc returns to the aggregate user list.
+The detail view includes each session's `pts/N` terminal alongside its latest
+process name.
 
 Reverse DNS is the only asynchronous lookup. Results are sent back through a
 channel and cached by IP. Service names are loaded from `/etc/services`.

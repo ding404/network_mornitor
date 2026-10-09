@@ -35,6 +35,17 @@ pub struct SessionProcess {
     pub(crate) start_ticks: u64,
 }
 
+/// One user's session row, retaining the terminal-specific login and process
+/// information used by the selected-user detail view.
+#[derive(Clone)]
+pub struct UserSession {
+    pub user: String,
+    pub tty: String,
+    pub online: bool,
+    pub last_login: u64,
+    pub last_process: Option<SessionProcess>,
+}
+
 #[derive(Clone)]
 struct LastLogin {
     uid: u32,
@@ -50,6 +61,7 @@ pub struct UserRow {
     pub sessions: usize,
     pub last_login: u64,
     pub last_process: Option<SessionProcess>,
+    pub session_rows: Vec<UserSession>,
 }
 
 /// One sampled connection (or UDP socket).
@@ -256,13 +268,25 @@ impl ConnSampler {
             let user = self.resolve_user(login.uid);
             if let Some(row) = rows.iter_mut().find(|row| row.user == user) {
                 row.last_login = row.last_login.max(login.login_time);
+                if !row.online {
+                    if let Some(session) = row.session_rows.first_mut() {
+                        session.last_login = session.last_login.max(login.login_time);
+                    }
+                }
             } else {
                 rows.push(UserRow {
-                    user,
+                    user: user.clone(),
                     online: false,
                     sessions: 0,
                     last_login: login.login_time,
                     last_process: None,
+                    session_rows: vec![UserSession {
+                        user,
+                        tty: "-".to_string(),
+                        online: false,
+                        last_login: login.login_time,
+                        last_process: None,
+                    }],
                 });
             }
         }
@@ -712,9 +736,17 @@ fn aggregate_user_rows(sessions: &[LoginSession], processes: &[SessionProcess]) 
             sessions: 0,
             last_login: 0,
             last_process: None,
+            session_rows: Vec::new(),
         });
         row.sessions += 1;
         row.last_login = row.last_login.max(session.login_time);
+        row.session_rows.push(UserSession {
+            user: session.user.clone(),
+            tty: session.tty.clone(),
+            online: true,
+            last_login: session.login_time,
+            last_process: None,
+        });
     }
     for process in processes {
         if !active.contains(&(process.user.clone(), process.tty.clone())) {
@@ -728,10 +760,27 @@ fn aggregate_user_rows(sessions: &[LoginSession], processes: &[SessionProcess]) 
             if replace {
                 row.last_process = Some(process.clone());
             }
+            if let Some(session) = row
+                .session_rows
+                .iter_mut()
+                .find(|session| session.user == process.user && session.tty == process.tty)
+            {
+                let replace = session
+                    .last_process
+                    .as_ref()
+                    .is_none_or(|old| process.start_ticks > old.start_ticks);
+                if replace {
+                    session.last_process = Some(process.clone());
+                }
+            }
         }
     }
 
     let mut rows: Vec<UserRow> = rows.into_values().collect();
+    for row in &mut rows {
+        row.session_rows
+            .sort_by_key(|session| std::cmp::Reverse(session.last_login));
+    }
     sort_user_rows(&mut rows);
     rows
 }
@@ -1695,6 +1744,7 @@ mod tests {
                 sessions: 0,
                 last_login: 100,
                 last_process: None,
+                session_rows: Vec::new(),
             },
             UserRow {
                 user: "alice".into(),
@@ -1702,6 +1752,7 @@ mod tests {
                 sessions: 1,
                 last_login: 200,
                 last_process: None,
+                session_rows: Vec::new(),
             },
             UserRow {
                 user: "zoe".into(),
@@ -1709,6 +1760,7 @@ mod tests {
                 sessions: 1,
                 last_login: 300,
                 last_process: None,
+                session_rows: Vec::new(),
             },
             UserRow {
                 user: "aaron".into(),
@@ -1716,6 +1768,7 @@ mod tests {
                 sessions: 0,
                 last_login: 400,
                 last_process: None,
+                session_rows: Vec::new(),
             },
         ];
 
@@ -1725,6 +1778,51 @@ mod tests {
             rows.iter().map(|row| row.user.as_str()).collect::<Vec<_>>(),
             ["zoe", "alice", "aaron", "bob"]
         );
+    }
+
+    #[test]
+    fn preserves_all_user_sessions_sorted_by_latest_login() {
+        let sessions = vec![
+            LoginSession {
+                user: "dj".into(),
+                tty: "pts/1".into(),
+                login_time: 100,
+            },
+            LoginSession {
+                user: "dj".into(),
+                tty: "pts/2".into(),
+                login_time: 200,
+            },
+        ];
+        let processes = vec![
+            SessionProcess {
+                user: "dj".into(),
+                tty: "pts/1".into(),
+                comm: "bash".into(),
+                started_at: 150,
+                start_ticks: 10,
+            },
+            SessionProcess {
+                user: "dj".into(),
+                tty: "pts/2".into(),
+                comm: "vim".into(),
+                started_at: 250,
+                start_ticks: 20,
+            },
+        ];
+
+        let rows = aggregate_user_rows(&sessions, &processes);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_rows.len(), 2);
+        assert_eq!(rows[0].session_rows[0].tty, "pts/2");
+        assert_eq!(rows[0].session_rows[0].last_login, 200);
+        assert_eq!(
+            rows[0].session_rows[0].last_process.as_ref().unwrap().comm,
+            "vim"
+        );
+        assert_eq!(rows[0].session_rows[1].tty, "pts/1");
+        assert_eq!(rows[0].session_rows[1].last_login, 100);
     }
 
     fn utmp_fixture(record_size: usize, time_offset: usize, timestamp: u64) -> Vec<u8> {

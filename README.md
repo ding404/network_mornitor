@@ -262,7 +262,10 @@ lower panel to users. Active `utmp` sessions are grouped by username, and
 accounts with a record in `/var/log/lastlog` are included even when they are
 currently offline. The table shows status, session count, newest login time,
 and the newest currently running process on any online user's SSH `pts/N`
-terminal.
+terminal. Use ↑/↓ to position on a user and press Enter to show every session
+for that user; session rows are sorted by last login descending. Press Esc to
+return to the user list. In session detail, the `LAST PROCESS` cell includes
+the session terminal (for example `pts/2 vim`).
 
 If the host does not expose a readable utmp file, online sessions are inferred
 from running processes with a `pts/N` controlling terminal.

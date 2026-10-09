@@ -3,7 +3,7 @@ mod metrics;
 mod ui;
 use conns::ConnMonitor;
 #[cfg(test)]
-use conns::{AggRow, ConnStat, SessionProcess, UserRow};
+use conns::{AggRow, ConnStat, SessionProcess, UserRow, UserSession};
 use metrics::{
     read_host_uptime, read_sys_disk_sectors, read_system_cpu, read_system_disk_space,
     read_system_mem_pct, read_system_swap_pct,
@@ -156,6 +156,8 @@ struct App {
     focus_conns: bool,
     /// Show the aggregated online-user panel instead of connections.
     show_users: bool,
+    /// Selected username whose individual sessions are shown in the user panel.
+    selected_user: Option<String>,
     /// Aggregate connections by process instead of listing each socket.
     aggregate: bool,
     /// Whether the user is currently typing a filter.
@@ -210,6 +212,7 @@ impl App {
             conns: ConnMonitor::new(),
             focus_conns: false,
             show_users: false,
+            selected_user: None,
             aggregate: false,
             filter_mode: false,
             filter: String::new(),
@@ -764,8 +767,15 @@ fn run_app<B: Backend>(
                         continue;
                     }
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
                             return Ok(());
+                        }
+                        KeyCode::Esc => {
+                            if app.selected_user.take().is_some() {
+                                app.conns.scroll_top();
+                            } else {
+                                return Ok(());
+                            }
                         }
                         KeyCode::Char('r') | KeyCode::Char('R') => {
                             // Reset history, peak, connection monitor and filter.
@@ -773,6 +783,7 @@ fn run_app<B: Backend>(
                             app.conns.reset();
                             app.filter.clear();
                             app.filter_mode = false;
+                            app.selected_user = None;
                         }
                         KeyCode::Char('/') => {
                             // Enter filter input mode.
@@ -785,7 +796,14 @@ fn run_app<B: Backend>(
                         }
                         KeyCode::Char('u') | KeyCode::Char('U') => {
                             app.show_users = !app.show_users;
+                            app.selected_user = None;
                             app.conns.scroll_top();
+                        }
+                        KeyCode::Enter if app.show_users && app.selected_user.is_none() => {
+                            if let Some(user) = app.conns.users.get(app.conns.scroll) {
+                                app.selected_user = Some(user.user.clone());
+                                app.conns.scroll_top();
+                            }
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') => {
                             // Toggle aggregate-by-process view.
@@ -1203,6 +1221,7 @@ mod tests {
                 started_at: 1_609_459_200,
                 start_ticks: 1,
             }),
+            session_rows: Vec::new(),
         }];
         let backend = TestBackend::new(80, 20);
         let mut term = Terminal::new(backend).unwrap();
@@ -1219,5 +1238,52 @@ mod tests {
         assert!(rendered.contains("SESSIONS LAST LOGIN"));
         assert!(rendered.contains("LAST PROCESS STARTED"));
         assert_eq!(rendered.matches("2021-01-01 08:00:00").count(), 2);
+    }
+
+    #[test]
+    fn selected_user_table_shows_all_sessions() {
+        let mut app = sample_app();
+        app.show_users = true;
+        app.selected_user = Some("dj".into());
+        app.conns.users = vec![UserRow {
+            user: "dj".into(),
+            online: true,
+            sessions: 2,
+            last_login: 1_672_531_200,
+            last_process: None,
+            session_rows: vec![
+                UserSession {
+                    user: "dj".into(),
+                    tty: "pts/2".into(),
+                    online: true,
+                    last_login: 1_672_531_200,
+                    last_process: None,
+                },
+                UserSession {
+                    user: "dj".into(),
+                    tty: "pts/1".into(),
+                    online: true,
+                    last_login: 1_609_459_200,
+                    last_process: None,
+                },
+            ],
+        }];
+        let backend = TestBackend::new(100, 20);
+        let mut term = Terminal::new(backend).unwrap();
+
+        term.draw(|f| ui(f, &mut app)).unwrap();
+
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Sessions for dj"));
+        assert!(rendered.contains("pts/2"));
+        assert!(rendered.contains("pts/1"));
+        assert_eq!(rendered.matches("2021-01-01 08:00:00").count(), 1);
+        assert!(rendered.contains("2023-01-01 08:00:00"));
     }
 }

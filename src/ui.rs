@@ -600,29 +600,94 @@ fn format_epoch_clock(timestamp: u64) -> String {
     crate::format_epoch_datetime(timestamp)
 }
 
-/// Render users aggregated by username, including accounts found in lastlog.
+#[derive(Clone)]
+struct UserTableRow {
+    user: String,
+    tty: String,
+    online: bool,
+    sessions: usize,
+    last_login: u64,
+    last_process: Option<crate::conns::SessionProcess>,
+}
+
+/// Render users aggregated by username, or all sessions for the selected user.
 fn render_user_panel(f: &mut Frame, area: Rect, app: &mut App) {
     let users = app.conns.users.clone();
+    if let Some(selected) = app.selected_user.clone() {
+        if let Some(user) = users.iter().find(|user| user.user == selected) {
+            let rows = user
+                .session_rows
+                .iter()
+                .map(|session| UserTableRow {
+                    user: session.user.clone(),
+                    tty: session.tty.clone(),
+                    online: session.online,
+                    sessions: usize::from(session.online),
+                    last_login: session.last_login,
+                    last_process: session.last_process.clone(),
+                })
+                .collect();
+            render_user_table(
+                f,
+                area,
+                app,
+                format!("Sessions for {}", user.user),
+                rows,
+                " no session records ",
+            );
+            return;
+        }
+        app.selected_user = None;
+    }
+
+    let rows = users
+        .iter()
+        .map(|user| UserTableRow {
+            user: user.user.clone(),
+            tty: String::new(),
+            online: user.online,
+            sessions: user.sessions,
+            last_login: user.last_login,
+            last_process: user.last_process.clone(),
+        })
+        .collect();
+    render_user_table(f, area, app, "Users".to_string(), rows, " no user records ");
+}
+
+fn render_user_table(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    title_prefix: String,
+    rows: Vec<UserTableRow>,
+    empty_message: &str,
+) {
     let max_rows = area.height.saturating_sub(3) as usize;
-    app.conns.clamp_scroll(users.len(), max_rows.max(1));
-    let first = if users.is_empty() {
+    app.conns.clamp_scroll(rows.len(), max_rows.max(1));
+    let first = if rows.is_empty() {
         0
     } else {
         app.conns.scroll + 1
     };
-    let last = (app.conns.scroll + max_rows).min(users.len());
+    let last = (app.conns.scroll + max_rows).min(rows.len());
     let title = format!(
-        " Users {}-{}/{}  u:users c:connections ↑↓:scroll ",
+        " {} {}-{}/{}  ↑↓:scroll {} ",
+        title_prefix,
         first,
         last.max(first),
-        users.len()
+        rows.len(),
+        if title_prefix == "Users" {
+            "Enter: sessions  u:users c:connections"
+        } else {
+            "Esc: back  u:users c:connections"
+        }
     );
     let block = Block::default().borders(Borders::ALL).title(title);
     app.header_y = 0;
     app.col_hit.clear();
 
-    if users.is_empty() {
-        f.render_widget(Paragraph::new(" no online users ").block(block), area);
+    if rows.is_empty() {
+        f.render_widget(Paragraph::new(empty_message).block(block), area);
         return;
     }
 
@@ -643,7 +708,7 @@ fn render_user_panel(f: &mut Frame, area: Rect, app: &mut App) {
         Cell::from("STARTED"),
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
-    let rows = users
+    let rows = rows
         .iter()
         .skip(app.conns.scroll)
         .take(max_rows.max(1))
@@ -655,8 +720,22 @@ fn render_user_panel(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default()
             };
             let (process, started) = match user.last_process.as_ref() {
-                Some(process) => (process.comm.clone(), format_epoch_clock(process.started_at)),
-                None => ("n/a".to_string(), "n/a".to_string()),
+                Some(process) => (
+                    if user.tty.is_empty() {
+                        process.comm.clone()
+                    } else {
+                        format!("{} {}", user.tty, process.comm)
+                    },
+                    format_epoch_clock(process.started_at),
+                ),
+                None => (
+                    if user.tty.is_empty() {
+                        "n/a".to_string()
+                    } else {
+                        format!("{} n/a", user.tty)
+                    },
+                    "n/a".to_string(),
+                ),
             };
             Row::new(vec![
                 Cell::from(if user.online { "online" } else { "offline" }),
