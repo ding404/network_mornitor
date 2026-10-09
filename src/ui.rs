@@ -627,8 +627,8 @@ fn render_user_panel(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let widths = [
-        Constraint::Length(8),  // STATUS
-        Constraint::Length(10), // USER
+        Constraint::Length(7),  // STATUS
+        Constraint::Length(6),  // USER
         Constraint::Length(8),  // SESSIONS
         Constraint::Length(19), // LAST LOGIN
         Constraint::Length(12), // LAST PROCESS
@@ -671,7 +671,7 @@ fn render_user_panel(f: &mut Frame, area: Rect, app: &mut App) {
     let table = Table::default()
         .header(header)
         .block(block)
-        .column_spacing(0)
+        .column_spacing(1)
         .widths(widths)
         .rows(rows);
     f.render_widget(table, area);

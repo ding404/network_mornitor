@@ -1216,6 +1216,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
+        assert!(rendered.contains("SESSIONS LAST LOGIN"));
+        assert!(rendered.contains("LAST PROCESS STARTED"));
         assert_eq!(rendered.matches("2021-01-01 08:00:00").count(), 2);
     }
 }
