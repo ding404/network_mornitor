@@ -134,7 +134,11 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
             .margin(1)
             .constraints([Constraint::Min(0)])
             .split(area)[0];
-        render_conn_panel(f, panel_area, app);
+        if app.show_users {
+            render_user_panel(f, panel_area, app);
+        } else {
+            render_conn_panel(f, panel_area, app);
+        }
     } else {
         let outer = Layout::default()
             .direction(Direction::Vertical)
@@ -145,7 +149,11 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
             ])
             .split(area);
         render_top(f, outer[0], app);
-        render_conn_panel(f, outer[1], app);
+        if app.show_users {
+            render_user_panel(f, outer[1], app);
+        } else {
+            render_conn_panel(f, outer[1], app);
+        }
     }
 }
 
@@ -178,6 +186,13 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
             format!("iface {}/{}", app.iface_idx + 1, app.ifaces.len()),
             Style::default().fg(Color::DarkGray),
         ),
+        Span::raw("  │  "),
+        Span::styled(
+            format!("uptime: {}", crate::format_uptime(app.host_uptime)),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw("  │  "),
+        Span::styled("u: users", Style::default().fg(Color::DarkGray)),
         Span::raw("  │  "),
         Span::styled("n/p: iface", Style::default().fg(Color::DarkGray)),
         Span::raw("  │  "),
@@ -576,6 +591,90 @@ fn render_top(f: &mut Frame, area: Rect, app: &App) {
         ),
     ]));
     f.render_widget(footer, main_layout[2]);
+}
+
+fn format_epoch_clock(timestamp: u64) -> String {
+    if timestamp == 0 {
+        return "n/a".to_string();
+    }
+    crate::format_epoch_datetime(timestamp)
+}
+
+/// Render users aggregated by username, including accounts found in lastlog.
+fn render_user_panel(f: &mut Frame, area: Rect, app: &mut App) {
+    let users = app.conns.users.clone();
+    let max_rows = area.height.saturating_sub(3) as usize;
+    app.conns.clamp_scroll(users.len(), max_rows.max(1));
+    let first = if users.is_empty() {
+        0
+    } else {
+        app.conns.scroll + 1
+    };
+    let last = (app.conns.scroll + max_rows).min(users.len());
+    let title = format!(
+        " Users {}-{}/{}  u:users c:connections ↑↓:scroll ",
+        first,
+        last.max(first),
+        users.len()
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    app.header_y = 0;
+    app.col_hit.clear();
+
+    if users.is_empty() {
+        f.render_widget(Paragraph::new(" no online users ").block(block), area);
+        return;
+    }
+
+    let widths = [
+        Constraint::Length(8),  // STATUS
+        Constraint::Length(10), // USER
+        Constraint::Length(8),  // SESSIONS
+        Constraint::Length(19), // LAST LOGIN
+        Constraint::Length(12), // LAST PROCESS
+        Constraint::Length(19), // STARTED
+    ];
+    let header = Row::new(vec![
+        Cell::from("STATUS"),
+        Cell::from("USER"),
+        Cell::from("SESSIONS"),
+        Cell::from("LAST LOGIN"),
+        Cell::from("LAST PROCESS"),
+        Cell::from("STARTED"),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows = users
+        .iter()
+        .skip(app.conns.scroll)
+        .take(max_rows.max(1))
+        .enumerate()
+        .map(|(index, user)| {
+            let style = if (app.conns.scroll + index) % 2 == 1 {
+                Style::default().bg(ZEBRA)
+            } else {
+                Style::default()
+            };
+            let (process, started) = match user.last_process.as_ref() {
+                Some(process) => (process.comm.clone(), format_epoch_clock(process.started_at)),
+                None => ("n/a".to_string(), "n/a".to_string()),
+            };
+            Row::new(vec![
+                Cell::from(if user.online { "online" } else { "offline" }),
+                Cell::from(user.user.clone()),
+                Cell::from(user.sessions.to_string()),
+                Cell::from(format_epoch_clock(user.last_login)),
+                Cell::from(process),
+                Cell::from(started),
+            ])
+            .style(style)
+        });
+    let table = Table::default()
+        .header(header)
+        .block(block)
+        .column_spacing(0)
+        .widths(widths)
+        .rows(rows);
+    f.render_widget(table, area);
 }
 
 /// Column that the Top Connections list can be sorted by. `Throughput` is the

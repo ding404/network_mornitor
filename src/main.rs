@@ -3,10 +3,10 @@ mod metrics;
 mod ui;
 use conns::ConnMonitor;
 #[cfg(test)]
-use conns::{AggRow, ConnStat};
+use conns::{AggRow, ConnStat, SessionProcess, UserRow};
 use metrics::{
-    read_sys_disk_sectors, read_system_cpu, read_system_disk_space, read_system_mem_pct,
-    read_system_swap_pct,
+    read_host_uptime, read_sys_disk_sectors, read_system_cpu, read_system_disk_space,
+    read_system_mem_pct, read_system_swap_pct,
 };
 #[cfg(test)]
 use ui::{sort_rows, ConnRow};
@@ -41,6 +41,32 @@ fn shanghai_hms(utc_secs: u64) -> (u32, u32, u32) {
     let m = (local / 60) % 60;
     let s = local % 60;
     (h as u32, m as u32, s as u32)
+}
+
+/// Convert a UNIX timestamp to a Gregorian date and time in Asia/Shanghai.
+fn shanghai_datetime(utc_secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    const SHANGHAI_OFFSET: i64 = 8 * 3600;
+    let max_secs = (i64::MAX - SHANGHAI_OFFSET) as u64;
+    let local = utc_secs.min(max_secs) as i64 + SHANGHAI_OFFSET;
+    let days = local.div_euclid(86_400);
+    let day_seconds = local.rem_euclid(86_400);
+
+    // Civil date conversion from days since 1970-01-01, Gregorian calendar.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let month_part = (5 * doy + 2) / 153;
+    let day = doy - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    year += if month <= 2 { 1 } else { 0 };
+
+    let hour = (day_seconds / 3_600) as u32;
+    let minute = ((day_seconds / 60) % 60) as u32;
+    let second = (day_seconds % 60) as u32;
+    (year, month as u32, day as u32, hour, minute, second)
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -88,6 +114,8 @@ struct App {
     sys_disk_space_avail: u64,
     /// Device path of the largest `/dev` disk (e.g. `/dev/sdd`), for the live label.
     sys_disk_space_dev: String,
+    /// Host uptime in seconds, read from `/proc/uptime`.
+    host_uptime: f64,
     /// Previous cumulative disk read sectors (from /proc/diskstats) for the delta.
     prev_disk_read_sectors: u64,
     /// Previous cumulative disk write sectors for the delta.
@@ -126,6 +154,8 @@ struct App {
     conns: ConnMonitor,
     /// Focus mode: the connections panel fills the whole screen.
     focus_conns: bool,
+    /// Show the aggregated online-user panel instead of connections.
+    show_users: bool,
     /// Aggregate connections by process instead of listing each socket.
     aggregate: bool,
     /// Whether the user is currently typing a filter.
@@ -160,6 +190,7 @@ impl App {
             sys_disk_space_used: 0,
             sys_disk_space_avail: 0,
             sys_disk_space_dev: String::new(),
+            host_uptime: 0.0,
             prev_disk_read_sectors: 0,
             prev_disk_write_sectors: 0,
             prev_disk_time: Instant::now(),
@@ -178,6 +209,7 @@ impl App {
             last_conns_sample: Instant::now(),
             conns: ConnMonitor::new(),
             focus_conns: false,
+            show_users: false,
             aggregate: false,
             filter_mode: false,
             filter: String::new(),
@@ -344,6 +376,10 @@ impl App {
         self.peak_speed = self.peak_speed.max(self.current_rx).max(self.current_tx);
 
         self.last_sample = now;
+
+        if let Some(uptime) = read_host_uptime() {
+            self.host_uptime = uptime.max(0.0);
+        }
 
         // Sample system-wide CPU and memory usage so their histories can be drawn
         // as waveforms below the DL/UL sparklines. Both are sampled every tick
@@ -614,6 +650,28 @@ fn fmt_time_plus(secs: f64) -> String {
     }
 }
 
+/// Format host uptime as days plus a 24-hour clock.
+fn format_uptime(secs: f64) -> String {
+    let total = secs.max(0.0).floor() as u64;
+    let days = total / 86_400;
+    let hours = (total / 3_600) % 24;
+    let minutes = (total / 60) % 60;
+    let seconds = total % 60;
+    if days > 0 {
+        format!("{}d {:02}:{:02}:{:02}", days, hours, minutes, seconds)
+    } else {
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    }
+}
+
+fn format_epoch_datetime(timestamp: u64) -> String {
+    let (year, month, day, hour, minute, second) = shanghai_datetime(timestamp);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hour, minute, second
+    )
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
@@ -723,6 +781,10 @@ fn run_app<B: Backend>(
                         KeyCode::Char('c') | KeyCode::Char('C') => {
                             // Toggle focus mode (connections fill the screen).
                             app.focus_conns = !app.focus_conns;
+                            app.conns.scroll_top();
+                        }
+                        KeyCode::Char('u') | KeyCode::Char('U') => {
+                            app.show_users = !app.show_users;
                             app.conns.scroll_top();
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -1113,5 +1175,47 @@ mod tests {
         assert_eq!(format_bytes_short(512), "512B");
         assert_eq!(format_bytes_short(1024), "1.0K");
         assert_eq!(format_bytes_short(1024 * 1024), "1.0M");
+    }
+
+    #[test]
+    fn formats_host_uptime_as_days_and_clock() {
+        assert_eq!(format_uptime(90061.7), "1d 01:01:01");
+    }
+
+    #[test]
+    fn formats_login_times_with_shanghai_date() {
+        assert_eq!(format_epoch_datetime(1_609_459_200), "2021-01-01 08:00:00");
+    }
+
+    #[test]
+    fn user_table_keeps_full_login_and_process_timestamps() {
+        let mut app = sample_app();
+        app.show_users = true;
+        app.conns.users = vec![UserRow {
+            user: "dj".into(),
+            online: true,
+            sessions: 1,
+            last_login: 1_609_459_200,
+            last_process: Some(SessionProcess {
+                user: "dj".into(),
+                tty: "pts/0".into(),
+                comm: "bash".into(),
+                started_at: 1_609_459_200,
+                start_ticks: 1,
+            }),
+        }];
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+
+        term.draw(|f| ui(f, &mut app)).unwrap();
+
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert_eq!(rendered.matches("2021-01-01 08:00:00").count(), 2);
     }
 }

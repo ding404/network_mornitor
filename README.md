@@ -76,19 +76,18 @@ This tool is Linux-only because it depends on `/proc/net/dev` and
 ```sh
 git clone <repository-url>
 cd network_mornitor
-cargo build --release
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-The binary is written to `target/release/netmon`.
+The binary is written to `target/x86_64-unknown-linux-musl/release/netmon`.
 
 ### Portable (static) build
 
-The default build links against the build host's glibc, so the binary will refuse
-to run on a machine with an *older* glibc (e.g. `GLIBC_2.39 not found`). To produce
-a single static binary that runs on any x86_64 Linux, build against musl instead:
+The project uses musl for builds by default, producing a single static binary
+that runs on x86_64 Linux without depending on the build host's glibc:
 
 ```sh
-rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
@@ -101,19 +100,19 @@ machines.
 Use the auto-detected default interface:
 
 ```sh
-cargo run --release
+cargo run --release --target x86_64-unknown-linux-musl
 ```
 
 Pass an interface name explicitly:
 
 ```sh
-cargo run --release -- eth0
+cargo run --release --target x86_64-unknown-linux-musl -- eth0
 ```
 
 You can also run the built binary directly:
 
 ```sh
-./target/release/netmon wlp2s0
+./target/x86_64-unknown-linux-musl/release/netmon wlp2s0
 ```
 
 ## Keys
@@ -255,6 +254,25 @@ but their RX/TX rates are always `n/a`. Only `ESTAB` TCP sockets are listed;
 
 If `ss` is not installed, the panel shows `ss unavailable` and the rest of the
 program keeps running.
+
+## Host uptime and online users
+
+The title bar shows host uptime from `/proc/uptime`. Press `u` to switch the
+lower panel to users. Active `utmp` sessions are grouped by username, and
+accounts with a record in `/var/log/lastlog` are included even when they are
+currently offline. The table shows status, session count, newest login time,
+and the newest currently running process on any online user's SSH `pts/N`
+terminal.
+
+If the host does not expose a readable utmp file, online sessions are inferred
+from running processes with a `pts/N` controlling terminal.
+
+Login and process timestamps use `YYYY-MM-DD HH:MM:SS` in Asia/Shanghai.
+
+The process timestamp is best-effort: processes that have already exited and
+shell builtins leave no `/proc` entry, so they cannot be recovered without
+system audit or process-accounting support. Press `u` again to return to the
+connection list. Accounts with no lastlog record are omitted.
 
 ## Project layout
 

@@ -8,6 +8,16 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
 
+/// Read host uptime in seconds from `/proc/uptime`.
+pub(crate) fn read_host_uptime() -> Option<f64> {
+    fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+}
+
 /// Read the aggregate `cpu` line from `/proc/stat` and return cumulative
 /// `(busy_ticks, total_ticks)`. Guest ticks are excluded because Linux already
 /// includes them in user/nice.

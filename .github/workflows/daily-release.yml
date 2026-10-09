@@ -33,8 +33,8 @@ jobs:
       - name: Verify
         run: |
           cargo fmt --all -- --check
-          cargo test --all-targets
-          cargo clippy --all-targets -- -D warnings
+          cargo test --target x86_64-unknown-linux-musl --all-targets
+          cargo clippy --target x86_64-unknown-linux-musl --all-targets -- -D warnings
 
       - name: Build portable binary
         run: cargo build --release --target x86_64-unknown-linux-musl

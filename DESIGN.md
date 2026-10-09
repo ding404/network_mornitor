@@ -72,6 +72,16 @@ PIDs visible in the current sample, then grouped into the optional aggregate
 view. Generation IDs prevent a snapshot from before a reset being applied after
 that reset.
 
+The same worker reads active `USER_PROCESS` records from utmp, scans `/proc`
+for processes whose controlling terminal matches an active `pts/N`, and reads
+`/var/log/lastlog` for historical login times. Sessions with the same username
+are collapsed into one row; the displayed login time is the newest value across
+utmp and lastlog. When utmp is unavailable, sessions are inferred from running
+processes with a `pts/N` controlling terminal. Accounts with no lastlog record
+are omitted when offline. A completed command or shell builtin is not
+recoverable from `/proc`, so the process column describes the newest process
+that is still running.
+
 Reverse DNS is the only asynchronous lookup. Results are sent back through a
 channel and cached by IP. Service names are loaded from `/etc/services`.
 
@@ -96,8 +106,9 @@ into an unusable area. The explicit `c` focus toggle uses the same panel layout.
 - A failed `/proc` read produces an unavailable metric or a zero sample where a
   history value is required; it does not terminate the monitor.
 - If `ss` is missing or exits unsuccessfully, the connection panel displays an
-  availability message while system metrics continue updating. A reset marks
-  the monitor available again so a later successful invocation can recover.
+  availability message while system metrics and the online-user panel continue
+  updating. A reset marks the monitor available again so a later successful
+  invocation can recover.
 - Hostname lookup failures are cached as misses and never block rendering.
 
 ## Verification
@@ -108,9 +119,7 @@ Recommended checks before merging changes are:
 
 ```sh
 cargo fmt -- --check
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo test --target x86_64-unknown-linux-musl --all-targets
+cargo clippy --target x86_64-unknown-linux-musl --all-targets -- -D warnings
+cargo build --release --target x86_64-unknown-linux-musl
 ```
-
-The musl target should also be checked when producing a portable Linux binary.

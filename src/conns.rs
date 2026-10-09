@@ -9,12 +9,48 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::net::IpAddr;
+use std::os::unix::fs::MetadataExt;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
+
+/// One currently logged-in user session read from utmp.
+#[derive(Clone)]
+pub struct LoginSession {
+    pub user: String,
+    pub tty: String,
+    pub login_time: u64,
+}
+
+/// One currently running process associated with a user's terminal.
+#[derive(Clone)]
+pub struct SessionProcess {
+    pub user: String,
+    pub tty: String,
+    pub comm: String,
+    pub started_at: u64,
+    pub(crate) start_ticks: u64,
+}
+
+#[derive(Clone)]
+struct LastLogin {
+    uid: u32,
+    login_time: u64,
+}
+
+/// One row in the online-user view. Same-name sessions are intentionally
+/// collapsed; timestamps are the newest values across those sessions.
+#[derive(Clone)]
+pub struct UserRow {
+    pub user: String,
+    pub online: bool,
+    pub sessions: usize,
+    pub last_login: u64,
+    pub last_process: Option<SessionProcess>,
+}
 
 /// One sampled connection (or UDP socket).
 #[derive(Clone)]
@@ -78,6 +114,10 @@ type Key = (String, String, String);
 struct ConnSampler {
     prev: HashMap<Key, (u64, u64, Instant)>,
     pub last: Vec<ConnStat>,
+    pub users: Vec<UserRow>,
+    lastlog_mtime: Option<std::time::SystemTime>,
+    lastlog_cache: Vec<LastLogin>,
+    last_users_refresh: Option<Instant>,
     /// Whether the last `ss` invocation succeeded. `false` when `ss` is
     /// missing or fails, in which case `last` is empty.
     pub available: bool,
@@ -114,6 +154,10 @@ impl ConnSampler {
         Self {
             prev: HashMap::new(),
             last: Vec::new(),
+            users: Vec::new(),
+            lastlog_mtime: None,
+            lastlog_cache: Vec::new(),
+            last_users_refresh: None,
             available: true,
             tx,
             rx,
@@ -135,6 +179,10 @@ impl ConnSampler {
         self.proc_prev.clear();
         self.proc_io_prev.clear();
         self.last.clear();
+        self.users.clear();
+        self.lastlog_mtime = None;
+        self.lastlog_cache.clear();
+        self.last_users_refresh = None;
         self.available = true;
     }
 
@@ -197,10 +245,107 @@ impl ConnSampler {
         self.procs = new_procs;
     }
 
+    /// Refresh online users from utmp and associate each row with the newest
+    /// currently running process on one of that user's active terminals.
+    fn refresh_users(&mut self) {
+        let processes = self.read_all_terminal_processes();
+        let sessions =
+            merge_login_sessions(read_login_sessions(), infer_login_sessions(&processes));
+        let mut rows = aggregate_user_rows(&sessions, &processes);
+        for login in self.read_last_login_cached() {
+            let user = self.resolve_user(login.uid);
+            if let Some(row) = rows.iter_mut().find(|row| row.user == user) {
+                row.last_login = row.last_login.max(login.login_time);
+            } else {
+                rows.push(UserRow {
+                    user,
+                    online: false,
+                    sessions: 0,
+                    last_login: login.login_time,
+                    last_process: None,
+                });
+            }
+        }
+        rows.sort_by(|a, b| a.user.cmp(&b.user));
+        self.users = rows;
+    }
+
+    /// Scan process stat files and retain processes with a known `/dev/pts/N`
+    /// controlling terminal. This also supplies an online-session fallback when
+    /// the host does not maintain a readable utmp file.
+    fn read_all_terminal_processes(&mut self) -> Vec<SessionProcess> {
+        let tty_names = terminal_device_names();
+        let boot_time = match read_boot_time() {
+            Some(value) => value,
+            None => return Vec::new(),
+        };
+        let clk = clk_tck();
+        let mut processes = Vec::new();
+        let entries = match std::fs::read_dir("/proc") {
+            Ok(entries) => entries,
+            Err(_) => return processes,
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let pid = match name.to_string_lossy().parse::<u32>() {
+                Ok(pid) => pid,
+                Err(_) => continue,
+            };
+            let uid = match read_proc_uid(pid) {
+                Some(uid) => uid,
+                None => continue,
+            };
+            let user = self.resolve_user(uid);
+            let info = match read_proc_session_info(pid) {
+                Some(info) => info,
+                None => continue,
+            };
+            let tty = match tty_names.get(&info.tty_nr) {
+                Some(tty) => tty,
+                None => continue,
+            };
+            processes.push(SessionProcess {
+                user,
+                tty: tty.clone(),
+                comm: info.comm,
+                started_at: boot_time.saturating_add(info.start_ticks / clk),
+                start_ticks: info.start_ticks,
+            });
+        }
+        processes
+    }
+
+    fn read_last_login_cached(&mut self) -> Vec<LastLogin> {
+        let metadata = match std::fs::metadata("/var/log/lastlog") {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                self.lastlog_mtime = None;
+                self.lastlog_cache.clear();
+                return Vec::new();
+            }
+        };
+        let modified = metadata.modified().ok();
+        if modified == self.lastlog_mtime {
+            return self.lastlog_cache.clone();
+        }
+        self.lastlog_cache = read_lastlog_file(metadata.len());
+        self.lastlog_mtime = modified;
+        self.lastlog_cache.clone()
+    }
+
     /// Run `ss`, parse it, compute per-connection rates and store the sorted
     /// result in `self.last`. Errors are swallowed at the worker boundary: on
     /// failure `available` is set to `false` and the list is cleared.
     fn sample(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        if self
+            .last_users_refresh
+            .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_secs(2))
+        {
+            self.refresh_users();
+            self.last_users_refresh = Some(now);
+        }
         let output = match Command::new("ss").args(["-tunpi"]).output() {
             Ok(o) => o,
             Err(e) => {
@@ -223,7 +368,6 @@ impl ConnSampler {
         }
 
         let text = String::from_utf8_lossy(&output.stdout);
-        let now = Instant::now();
         let lines: Vec<&str> = text.lines().collect();
         let mut conns: Vec<ConnStat> = Vec::new();
         let mut seen: HashSet<Key> = HashSet::new();
@@ -395,6 +539,7 @@ struct WorkerSnapshot {
     available: bool,
     last: Vec<ConnStat>,
     procs: HashMap<u32, ProcInfo>,
+    users: Vec<UserRow>,
 }
 
 /// UI-facing connection state. Expensive `ss` and `/proc/<pid>` reads happen in
@@ -403,6 +548,7 @@ struct WorkerSnapshot {
 pub struct ConnMonitor {
     pub scroll: usize,
     pub last: Vec<ConnStat>,
+    pub users: Vec<UserRow>,
     pub available: bool,
     procs: HashMap<u32, ProcInfo>,
     last_max_rows: usize,
@@ -422,13 +568,14 @@ impl ConnMonitor {
                 match command {
                     WorkerCommand::Sample(generation) => {
                         let result = sampler.sample();
-                        let (available, last, procs) = match result {
+                        let (available, last, procs, users) = match result {
                             Ok(()) => (
                                 sampler.available,
                                 sampler.last.clone(),
                                 sampler.procs.clone(),
+                                sampler.users.clone(),
                             ),
-                            Err(_) => (false, Vec::new(), HashMap::new()),
+                            Err(_) => (false, Vec::new(), HashMap::new(), sampler.users.clone()),
                         };
                         if snapshot_tx
                             .send(WorkerSnapshot {
@@ -436,6 +583,7 @@ impl ConnMonitor {
                                 available,
                                 last,
                                 procs,
+                                users,
                             })
                             .is_err()
                         {
@@ -452,6 +600,7 @@ impl ConnMonitor {
         Self {
             scroll: 0,
             last: Vec::new(),
+            users: Vec::new(),
             available: true,
             procs: HashMap::new(),
             last_max_rows: 10,
@@ -487,6 +636,7 @@ impl ConnMonitor {
             self.available = snapshot.available;
             self.last = snapshot.last;
             self.procs = snapshot.procs;
+            self.users = snapshot.users;
         }
     }
 
@@ -497,6 +647,7 @@ impl ConnMonitor {
         let _ = self.command_tx.send(WorkerCommand::Reset);
         self.sample_pending = false;
         self.procs.clear();
+        self.users.clear();
         self.scroll = 0;
         self.last.clear();
         self.available = true;
@@ -543,6 +694,381 @@ impl Drop for ConnMonitor {
     fn drop(&mut self) {
         let _ = self.command_tx.send(WorkerCommand::Shutdown);
     }
+}
+
+/// Collapse utmp sessions by username and retain the newest login and process
+/// timestamps. Processes from terminals that are not in `sessions` are ignored.
+fn aggregate_user_rows(sessions: &[LoginSession], processes: &[SessionProcess]) -> Vec<UserRow> {
+    let mut rows: HashMap<String, UserRow> = HashMap::new();
+    let active: HashSet<(String, String)> = sessions
+        .iter()
+        .map(|s| (s.user.clone(), s.tty.clone()))
+        .collect();
+
+    for session in sessions {
+        let row = rows.entry(session.user.clone()).or_insert_with(|| UserRow {
+            user: session.user.clone(),
+            online: true,
+            sessions: 0,
+            last_login: 0,
+            last_process: None,
+        });
+        row.sessions += 1;
+        row.last_login = row.last_login.max(session.login_time);
+    }
+    for process in processes {
+        if !active.contains(&(process.user.clone(), process.tty.clone())) {
+            continue;
+        }
+        if let Some(row) = rows.get_mut(&process.user) {
+            let replace = row
+                .last_process
+                .as_ref()
+                .is_none_or(|old| process.start_ticks > old.start_ticks);
+            if replace {
+                row.last_process = Some(process.clone());
+            }
+        }
+    }
+
+    let mut rows: Vec<UserRow> = rows.into_values().collect();
+    rows.sort_by(|a, b| a.user.cmp(&b.user));
+    rows
+}
+
+/// Infer one session per `(user, pts/N)` from currently running terminal
+/// processes. The earliest process on a terminal approximates the session's
+/// login time when utmp is unavailable.
+fn infer_login_sessions(processes: &[SessionProcess]) -> Vec<LoginSession> {
+    let mut first_start: HashMap<(String, String), u64> = HashMap::new();
+    for process in processes {
+        let key = (process.user.clone(), process.tty.clone());
+        let entry = first_start.entry(key).or_insert(process.started_at);
+        *entry = (*entry).min(process.started_at);
+    }
+    let mut sessions: Vec<LoginSession> = first_start
+        .into_iter()
+        .map(|((user, tty), login_time)| LoginSession {
+            user,
+            tty,
+            login_time,
+        })
+        .collect();
+    sessions.sort_by(|a, b| a.user.cmp(&b.user).then(a.tty.cmp(&b.tty)));
+    sessions
+}
+
+fn merge_login_sessions(
+    mut sessions: Vec<LoginSession>,
+    inferred: Vec<LoginSession>,
+) -> Vec<LoginSession> {
+    for candidate in inferred {
+        if !sessions
+            .iter()
+            .any(|session| session.user == candidate.user && session.tty == candidate.tty)
+        {
+            sessions.push(candidate);
+        }
+    }
+    sessions.sort_by(|a, b| a.user.cmp(&b.user).then(a.tty.cmp(&b.tty)));
+    sessions
+}
+
+/// Read active USER_PROCESS records from the system utmp database.
+fn read_login_sessions() -> Vec<LoginSession> {
+    let bytes = std::fs::read("/run/utmp")
+        .or_else(|_| std::fs::read("/var/run/utmp"))
+        .unwrap_or_default();
+    parse_utmp_bytes(&bytes)
+}
+
+const UTMP_GLIBC_RECORD_SIZE: usize = 384;
+const UTMP_MUSL_RECORD_SIZE: usize = 400;
+const UTMP_TYPE_OFFSET: usize = 0;
+const UTMP_LINE_OFFSET: usize = 8;
+const UTMP_USER_OFFSET: usize = 44;
+const UTMP_LINE_SIZE: usize = 32;
+const UTMP_USER_SIZE: usize = 32;
+const UTMP_GLIBC_TIME_OFFSET: usize = 340;
+const UTMP_MUSL_TIME_OFFSET: usize = 344;
+
+/// Parse Linux utmp records without calling libc's utmp functions. The latter
+/// are stubs in musl and are deprecated by the libc crate for the musl target.
+/// The file ABI is parsed explicitly because musl's in-memory `utmpx` layout
+/// is not identical to the glibc layout used by many login programs.
+fn parse_utmp_bytes(bytes: &[u8]) -> Vec<LoginSession> {
+    let record_size = match detect_utmp_record_size(bytes) {
+        Some(size) => size,
+        None => return Vec::new(),
+    };
+    bytes
+        .chunks_exact(record_size)
+        .filter_map(|chunk| {
+            let ut_type = u16::from_ne_bytes(
+                chunk[UTMP_TYPE_OFFSET..UTMP_TYPE_OFFSET + 2]
+                    .try_into()
+                    .ok()?,
+            );
+            if ut_type != 7 {
+                return None;
+            }
+            let user = bytes_to_string(&chunk[UTMP_USER_OFFSET..UTMP_USER_OFFSET + UTMP_USER_SIZE]);
+            let tty = bytes_to_string(&chunk[UTMP_LINE_OFFSET..UTMP_LINE_OFFSET + UTMP_LINE_SIZE]);
+            if user.is_empty() || tty.is_empty() {
+                return None;
+            }
+            let time_offset = if record_size == UTMP_MUSL_RECORD_SIZE {
+                UTMP_MUSL_TIME_OFFSET
+            } else {
+                UTMP_GLIBC_TIME_OFFSET
+            };
+            let login_time = if record_size == UTMP_MUSL_RECORD_SIZE {
+                u64::from_ne_bytes(chunk[time_offset..time_offset + 8].try_into().ok()?)
+            } else {
+                u32::from_ne_bytes(chunk[time_offset..time_offset + 4].try_into().ok()?) as u64
+            };
+            Some(LoginSession {
+                user,
+                tty,
+                login_time,
+            })
+        })
+        .collect()
+}
+
+fn detect_utmp_record_size(bytes: &[u8]) -> Option<usize> {
+    let mut best: Option<(usize, u32)> = None;
+    for record_size in [UTMP_GLIBC_RECORD_SIZE, UTMP_MUSL_RECORD_SIZE] {
+        if !bytes.len().is_multiple_of(record_size) {
+            continue;
+        }
+        let score = bytes
+            .chunks_exact(record_size)
+            .map(|record| {
+                if u16::from_ne_bytes(record[..2].try_into().unwrap()) != 7 {
+                    return 0;
+                }
+                let user =
+                    bytes_to_string(&record[UTMP_USER_OFFSET..UTMP_USER_OFFSET + UTMP_USER_SIZE]);
+                let tty =
+                    bytes_to_string(&record[UTMP_LINE_OFFSET..UTMP_LINE_OFFSET + UTMP_LINE_SIZE]);
+                if user.is_empty() || tty.is_empty() {
+                    return 0;
+                }
+                let time_offset = if record_size == UTMP_MUSL_RECORD_SIZE {
+                    UTMP_MUSL_TIME_OFFSET
+                } else {
+                    UTMP_GLIBC_TIME_OFFSET
+                };
+                let timestamp = if record_size == UTMP_MUSL_RECORD_SIZE {
+                    u64::from_ne_bytes(record[time_offset..time_offset + 8].try_into().unwrap())
+                } else {
+                    u32::from_ne_bytes(record[time_offset..time_offset + 4].try_into().unwrap())
+                        as u64
+                };
+                1 + plausible_lastlog_time(timestamp) as u32
+            })
+            .sum();
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((record_size, score));
+        }
+    }
+    best.map(|(record_size, _)| record_size)
+}
+
+fn read_lastlog_file(file_len: u64) -> Vec<LastLogin> {
+    let mut file = match std::fs::File::open("/var/log/lastlog") {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    let record_size = match detect_lastlog_record_size(&mut file, file_len) {
+        Some(size) => size,
+        None => return Vec::new(),
+    };
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return Vec::new();
+    }
+
+    let mut record = vec![0u8; record_size];
+    let mut entries = Vec::new();
+    for uid in 0..(file_len / record_size as u64) {
+        if file.read_exact(&mut record).is_err() {
+            break;
+        }
+        let login_time = lastlog_time(&record, record_size);
+        if login_time > 0 {
+            entries.push(LastLogin {
+                uid: uid as u32,
+                login_time,
+            });
+        }
+    }
+    entries
+}
+
+/// Parse Linux lastlog records. glibc commonly uses a 4-byte time field
+/// (292-byte records on x86_64), while musl uses an 8-byte time field
+/// (296-byte records). The sparse file size identifies the active layout.
+#[cfg(test)]
+fn parse_lastlog_bytes(bytes: &[u8]) -> Vec<LastLogin> {
+    let record_size = match detect_lastlog_record_size_from_bytes(bytes) {
+        Some(size) => size,
+        None => return Vec::new(),
+    };
+    let mut entries = Vec::new();
+    for (uid, record) in bytes.chunks_exact(record_size).enumerate() {
+        let login_time = lastlog_time(record, record_size);
+        if login_time > 0 {
+            entries.push(LastLogin {
+                uid: uid as u32,
+                login_time,
+            });
+        }
+    }
+    entries
+}
+
+fn lastlog_time(record: &[u8], record_size: usize) -> u64 {
+    if record_size == 296 {
+        u64::from_ne_bytes(record[..8].try_into().unwrap())
+    } else {
+        u32::from_ne_bytes(record[..4].try_into().unwrap()) as u64
+    }
+}
+
+fn plausible_lastlog_time(timestamp: u64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(u64::MAX);
+    timestamp > 0 && timestamp <= now.saturating_add(86_400)
+}
+
+#[cfg(test)]
+fn detect_lastlog_record_size_from_bytes(bytes: &[u8]) -> Option<usize> {
+    let candidates: Vec<usize> = [292, 296]
+        .into_iter()
+        .filter(|size| bytes.len().is_multiple_of(*size))
+        .collect();
+    let mut best: Option<(usize, u8)> = None;
+    for size in candidates {
+        let score = bytes
+            .chunks_exact(size)
+            .take(4096)
+            .map(|record| plausible_lastlog_time(lastlog_time(record, size)) as u8)
+            .sum::<u8>();
+        // Preserve the candidate order on ties: 292 is the common glibc file
+        // layout, and an empty/ambiguous file has no timestamp to recover.
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((size, score));
+        }
+    }
+    best.map(|(size, _)| size)
+}
+
+fn detect_lastlog_record_size(file: &mut std::fs::File, file_len: u64) -> Option<usize> {
+    let candidates: Vec<usize> = [292, 296]
+        .into_iter()
+        .filter(|size| file_len.is_multiple_of(*size as u64))
+        .collect();
+    let mut best: Option<(usize, u32)> = None;
+    for size in candidates {
+        let mut score = 0u32;
+        let sample_count = (file_len / size as u64).min(4096);
+        for uid in 0..sample_count {
+            if file
+                .seek(SeekFrom::Start(uid * size as u64))
+                .and_then(|_| {
+                    let mut head = [0u8; 8];
+                    file.read_exact(&mut head).map(|_| head)
+                })
+                .map(|head| {
+                    let timestamp = lastlog_time(&head, size);
+                    if plausible_lastlog_time(timestamp) {
+                        score += 1;
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+        // Preserve the candidate order on ties; see the byte-slice detector.
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((size, score));
+        }
+    }
+    best.map(|(size, _)| size)
+}
+
+fn bytes_to_string(value: &[u8]) -> String {
+    let bytes: Vec<u8> = value.iter().copied().take_while(|&c| c != 0).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn terminal_device_names() -> HashMap<u64, String> {
+    let mut names = HashMap::new();
+    let entries = match std::fs::read_dir("/dev/pts") {
+        Ok(entries) => entries,
+        Err(_) => return names,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.parse::<u32>().is_err() {
+            continue;
+        }
+        if let Ok(metadata) = entry.metadata() {
+            names.insert(metadata.rdev(), format!("pts/{name}"));
+        }
+    }
+    names
+}
+
+struct ProcSessionInfo {
+    comm: String,
+    tty_nr: u64,
+    start_ticks: u64,
+}
+
+/// Read the controlling terminal and process start time from `/proc/<pid>/stat`.
+fn read_proc_session_info(pid: u32) -> Option<ProcSessionInfo> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let left = content.find('(')?;
+    let right = content.rfind(')')?;
+    if right <= left {
+        return None;
+    }
+    let comm = content[left + 1..right].to_string();
+    let fields: Vec<&str> = content[right + 1..].split_whitespace().collect();
+    if fields.len() <= 19 {
+        return None;
+    }
+    let tty_nr = fields[4].parse::<i64>().ok()?.max(0) as u64;
+    let start_ticks = fields[19].parse::<u64>().ok()?;
+    Some(ProcSessionInfo {
+        comm,
+        tty_nr,
+        start_ticks,
+    })
+}
+
+fn read_proc_uid(pid: u32) -> Option<u32> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    content
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
+fn read_boot_time() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/stat").ok()?;
+    content
+        .lines()
+        .find(|line| line.starts_with("btime "))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 /// Parse `users:(("name",pid=N,fd=M), ...)` and return the first owner's
@@ -1109,6 +1635,202 @@ mod tests {
         assert!((app_row.tx_rate - 50.0).abs() < 1e-9);
         let other = agg.iter().find(|r| r.comm == "other").unwrap();
         assert_eq!(other.count, 1);
+    }
+
+    #[test]
+    fn aggregates_same_user_by_latest_login_and_process() {
+        let sessions = vec![
+            LoginSession {
+                user: "dj".into(),
+                tty: "pts/0".into(),
+                login_time: 100,
+            },
+            LoginSession {
+                user: "dj".into(),
+                tty: "pts/2".into(),
+                login_time: 200,
+            },
+        ];
+        let processes = vec![
+            SessionProcess {
+                user: "dj".into(),
+                tty: "pts/0".into(),
+                comm: "bash".into(),
+                started_at: 150,
+                start_ticks: 10,
+            },
+            SessionProcess {
+                user: "dj".into(),
+                tty: "pts/2".into(),
+                comm: "vim".into(),
+                started_at: 250,
+                start_ticks: 20,
+            },
+        ];
+
+        let rows = aggregate_user_rows(&sessions, &processes);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user, "dj");
+        assert_eq!(rows[0].sessions, 2);
+        assert_eq!(rows[0].last_login, 200);
+        assert_eq!(rows[0].last_process.as_ref().unwrap().comm, "vim");
+        assert_eq!(rows[0].last_process.as_ref().unwrap().started_at, 250);
+    }
+
+    fn utmp_fixture(record_size: usize, time_offset: usize, timestamp: u64) -> Vec<u8> {
+        let mut record = vec![0u8; record_size];
+        record[..2].copy_from_slice(&7u16.to_ne_bytes());
+        record[UTMP_LINE_OFFSET..UTMP_LINE_OFFSET + 5].copy_from_slice(b"pts/7");
+        record[UTMP_USER_OFFSET..UTMP_USER_OFFSET + 2].copy_from_slice(b"dj");
+        if record_size == UTMP_MUSL_RECORD_SIZE {
+            record[time_offset..time_offset + 8].copy_from_slice(&timestamp.to_ne_bytes());
+        } else {
+            record[time_offset..time_offset + 4].copy_from_slice(&(timestamp as u32).to_ne_bytes());
+        }
+        record
+    }
+
+    #[test]
+    fn parses_glibc_utmp_file_layout() {
+        let bytes = utmp_fixture(UTMP_GLIBC_RECORD_SIZE, UTMP_GLIBC_TIME_OFFSET, 1234);
+        let sessions = parse_utmp_bytes(&bytes);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].user, "dj");
+        assert_eq!(sessions[0].tty, "pts/7");
+        assert_eq!(sessions[0].login_time, 1234);
+    }
+
+    #[test]
+    fn parses_musl_utmp_file_layout() {
+        let bytes = utmp_fixture(UTMP_MUSL_RECORD_SIZE, UTMP_MUSL_TIME_OFFSET, 1234);
+        let sessions = parse_utmp_bytes(&bytes);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].user, "dj");
+        assert_eq!(sessions[0].tty, "pts/7");
+        assert_eq!(sessions[0].login_time, 1234);
+    }
+
+    #[test]
+    fn parses_lastlog_records_with_32_bit_time() {
+        let record_size = 292;
+        let mut bytes = vec![0u8; record_size * 2];
+        bytes[record_size..record_size + 4].copy_from_slice(&1234u32.to_ne_bytes());
+
+        let entries = parse_lastlog_bytes(&bytes);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uid, 1);
+        assert_eq!(entries[0].login_time, 1234);
+    }
+
+    #[test]
+    fn detects_ambiguous_lastlog_size_from_record_content() {
+        let record_size = 292;
+        let mut bytes = vec![0u8; record_size * 74];
+        bytes[record_size..record_size + 4].copy_from_slice(&1_609_459_200u32.to_ne_bytes());
+
+        let entries = parse_lastlog_bytes(&bytes);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uid, 1);
+        assert_eq!(entries[0].login_time, 1_609_459_200);
+    }
+
+    #[test]
+    fn parses_lastlog_records_with_64_bit_time() {
+        let mut bytes = vec![0u8; 296];
+        bytes[..8].copy_from_slice(&u64::MAX.to_ne_bytes());
+
+        let entries = parse_lastlog_bytes(&bytes);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uid, 0);
+        assert_eq!(entries[0].login_time, u64::MAX);
+    }
+
+    #[test]
+    fn infers_online_sessions_from_terminal_processes() {
+        let processes = vec![
+            SessionProcess {
+                user: "dj".into(),
+                tty: "pts/1".into(),
+                comm: "bash".into(),
+                started_at: 100,
+                start_ticks: 10,
+            },
+            SessionProcess {
+                user: "dj".into(),
+                tty: "pts/1".into(),
+                comm: "vim".into(),
+                started_at: 200,
+                start_ticks: 20,
+            },
+        ];
+
+        let sessions = infer_login_sessions(&processes);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].user, "dj");
+        assert_eq!(sessions[0].tty, "pts/1");
+        assert_eq!(sessions[0].login_time, 100);
+    }
+
+    #[test]
+    fn merges_inferred_sessions_with_partial_utmp() {
+        let utmp = vec![LoginSession {
+            user: "dj".into(),
+            tty: "pts/1".into(),
+            login_time: 100,
+        }];
+        let inferred = vec![
+            LoginSession {
+                user: "dj".into(),
+                tty: "pts/1".into(),
+                login_time: 100,
+            },
+            LoginSession {
+                user: "dj".into(),
+                tty: "pts/2".into(),
+                login_time: 200,
+            },
+        ];
+
+        let merged = merge_login_sessions(utmp, inferred);
+
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|s| s.tty == "pts/2"));
+    }
+
+    #[test]
+    fn chooses_latest_process_by_ticks_when_wall_seconds_match() {
+        let sessions = vec![LoginSession {
+            user: "dj".into(),
+            tty: "pts/1".into(),
+            login_time: 100,
+        }];
+        let processes = vec![
+            SessionProcess {
+                user: "dj".into(),
+                tty: "pts/1".into(),
+                comm: "old".into(),
+                started_at: 300,
+                start_ticks: 10,
+            },
+            SessionProcess {
+                user: "dj".into(),
+                tty: "pts/1".into(),
+                comm: "new".into(),
+                started_at: 300,
+                start_ticks: 20,
+            },
+        ];
+
+        let rows = aggregate_user_rows(&sessions, &processes);
+
+        assert_eq!(rows[0].last_process.as_ref().unwrap().comm, "new");
     }
 
     #[test]
