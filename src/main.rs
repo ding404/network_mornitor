@@ -1241,6 +1241,46 @@ mod tests {
     }
 
     #[test]
+    fn user_list_highlights_current_selection() {
+        let mut app = sample_app();
+        app.show_users = true;
+        app.conns.users = vec![
+            UserRow {
+                user: "alice".into(),
+                online: true,
+                sessions: 1,
+                last_login: 2,
+                last_process: None,
+                session_rows: Vec::new(),
+            },
+            UserRow {
+                user: "bob".into(),
+                online: false,
+                sessions: 0,
+                last_login: 1,
+                last_process: None,
+                session_rows: Vec::new(),
+            },
+        ];
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+
+        term.draw(|f| ui(f, &mut app)).unwrap();
+
+        let first_status = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "o" && cell.bg == ratatui::style::Color::Blue)
+            .unwrap();
+        assert_eq!(first_status.bg, ratatui::style::Color::Blue);
+        assert!(first_status
+            .modifier
+            .contains(ratatui::style::Modifier::BOLD));
+    }
+
+    #[test]
     fn selected_user_table_shows_all_sessions() {
         let mut app = sample_app();
         app.show_users = true;

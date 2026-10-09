@@ -635,6 +635,7 @@ fn render_user_panel(f: &mut Frame, area: Rect, app: &mut App) {
                 format!("Sessions for {}", user.user),
                 rows,
                 " no session records ",
+                false,
             );
             return;
         }
@@ -652,7 +653,15 @@ fn render_user_panel(f: &mut Frame, area: Rect, app: &mut App) {
             last_process: user.last_process.clone(),
         })
         .collect();
-    render_user_table(f, area, app, "Users".to_string(), rows, " no user records ");
+    render_user_table(
+        f,
+        area,
+        app,
+        "Users".to_string(),
+        rows,
+        " no user records ",
+        true,
+    );
 }
 
 fn sort_session_table_rows(rows: &mut [UserTableRow]) {
@@ -680,6 +689,7 @@ fn render_user_table(
     title_prefix: String,
     rows: Vec<UserTableRow>,
     empty_message: &str,
+    selectable: bool,
 ) {
     let max_rows = area.height.saturating_sub(3) as usize;
     app.conns.clamp_scroll(rows.len(), max_rows.max(1));
@@ -689,12 +699,18 @@ fn render_user_table(
         app.conns.scroll + 1
     };
     let last = (app.conns.scroll + max_rows).min(rows.len());
+    let navigation = if selectable {
+        "↑↓:select"
+    } else {
+        "↑↓:scroll"
+    };
     let title = format!(
-        " {} {}-{}/{}  ↑↓:scroll {} ",
+        " {} {}-{}/{}  {} {} ",
         title_prefix,
         first,
         last.max(first),
         rows.len(),
+        navigation,
         if title_prefix == "Users" {
             "Enter: sessions  u:users c:connections"
         } else {
@@ -733,7 +749,12 @@ fn render_user_table(
         .take(max_rows.max(1))
         .enumerate()
         .map(|(index, user)| {
-            let style = if (app.conns.scroll + index) % 2 == 1 {
+            let style = if selectable && index == 0 {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
+            } else if (app.conns.scroll + index) % 2 == 1 {
                 Style::default().bg(ZEBRA)
             } else {
                 Style::default()
