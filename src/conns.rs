@@ -266,7 +266,7 @@ impl ConnSampler {
                 });
             }
         }
-        rows.sort_by(|a, b| a.user.cmp(&b.user));
+        sort_user_rows(&mut rows);
         self.users = rows;
     }
 
@@ -732,8 +732,12 @@ fn aggregate_user_rows(sessions: &[LoginSession], processes: &[SessionProcess]) 
     }
 
     let mut rows: Vec<UserRow> = rows.into_values().collect();
-    rows.sort_by(|a, b| a.user.cmp(&b.user));
+    sort_user_rows(&mut rows);
     rows
+}
+
+fn sort_user_rows(rows: &mut [UserRow]) {
+    rows.sort_by(|a, b| b.online.cmp(&a.online).then_with(|| a.user.cmp(&b.user)));
 }
 
 /// Infer one session per `(user, pts/N)` from currently running terminal
@@ -1676,6 +1680,47 @@ mod tests {
         assert_eq!(rows[0].last_login, 200);
         assert_eq!(rows[0].last_process.as_ref().unwrap().comm, "vim");
         assert_eq!(rows[0].last_process.as_ref().unwrap().started_at, 250);
+    }
+
+    #[test]
+    fn sorts_online_users_before_offline_then_by_name() {
+        let mut rows = vec![
+            UserRow {
+                user: "zoe".into(),
+                online: false,
+                sessions: 0,
+                last_login: 0,
+                last_process: None,
+            },
+            UserRow {
+                user: "bob".into(),
+                online: true,
+                sessions: 1,
+                last_login: 0,
+                last_process: None,
+            },
+            UserRow {
+                user: "alice".into(),
+                online: true,
+                sessions: 1,
+                last_login: 0,
+                last_process: None,
+            },
+            UserRow {
+                user: "aaron".into(),
+                online: false,
+                sessions: 0,
+                last_login: 0,
+                last_process: None,
+            },
+        ];
+
+        sort_user_rows(&mut rows);
+
+        assert_eq!(
+            rows.iter().map(|row| row.user.as_str()).collect::<Vec<_>>(),
+            ["alice", "bob", "aaron", "zoe"]
+        );
     }
 
     fn utmp_fixture(record_size: usize, time_offset: usize, timestamp: u64) -> Vec<u8> {
